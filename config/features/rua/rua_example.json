@@ -1,0 +1,18 @@
+{
+  "items": [
+    {
+      "name": "示例九二",
+      "description": "示例描述",
+      "image": "example.png",
+      "favor": 1
+    }
+  ],
+  "levels": [
+    {
+      "min": 0,
+      "hearts": "♡",
+      "query": "继续努力贴贴~",
+      "draw": "今天也要开开心心~"
+    }
+  ]
+}
