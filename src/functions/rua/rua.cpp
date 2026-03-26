@@ -1,0 +1,987 @@
+#include "rua.h"
+
+#include "utils.h"
+
+#include <Magick++.h>
+
+#include <algorithm>
+#include <cmath>
+#include <list>
+#include <sstream>
+
+namespace {
+constexpr const char *CMD_GET_EN = "*rua.get ";
+constexpr const char *CMD_GET_ZH = "*查询92 ";
+constexpr const char *CMD_ADD_EN = "*rua.add ";
+constexpr const char *CMD_ADD_ZH = "*添加92 ";
+constexpr const char *CMD_DEL_EN = "*rua.del ";
+constexpr const char *CMD_DEL_ZH = "*删除92 ";
+
+bool starts_with(const std::string &s, const std::string &prefix)
+{
+    return s.size() >= prefix.size() &&
+           s.compare(0, prefix.size(), prefix) == 0;
+}
+
+std::vector<std::string> split_by_char(const std::string &s, char delim)
+{
+    std::vector<std::string> out;
+    std::string cur;
+    for (char ch : s) {
+        if (ch == delim) {
+            out.push_back(trim(cur));
+            cur.clear();
+        }
+        else {
+            cur.push_back(ch);
+        }
+    }
+    out.push_back(trim(cur));
+    return out;
+}
+
+std::string pick_extension_from_url(const std::string &url)
+{
+    size_t qpos = url.find('?');
+    std::string base = qpos == std::string::npos ? url : url.substr(0, qpos);
+    size_t dot = base.find_last_of('.');
+    if (dot == std::string::npos || dot + 1 >= base.size()) {
+        return ".png";
+    }
+    std::string ext = base.substr(dot);
+    if (ext.size() > 8 || ext.find('/') != std::string::npos) {
+        return ".png";
+    }
+    return ext;
+}
+
+std::string today_date_string()
+{
+    std::time_t now = std::time(nullptr);
+    std::tm local_tm = *std::localtime(&now);
+    std::ostringstream oss;
+    oss << std::put_time(&local_tm, "%Y-%m-%d");
+    return oss.str();
+}
+
+std::string rua_detail_help_public()
+{
+    return "*rua: 随机rua一只九二\n"
+           "*查询92好感度: 查看九二好感\n"
+           "*rua.help: 查看帮助\n"
+           "配置文件: <config>/features/rua/rua.json\n"
+           "状态文件: <config>/features/rua/rua_state.json";
+}
+} // namespace
+
+rua::rua()
+{
+    fs::create_directories(rua_resource_dir());
+    load_config();
+    load_favor_text_config();
+    load_favor_storage();
+    load_daily_limit_storage();
+}
+
+std::string rua::rua_config_path() const
+{
+    return (fs::path(config_dir_) / "features/rua/rua.json").string();
+}
+
+std::string rua::rua_state_path() const
+{
+    return (fs::path(config_dir_) / "features/rua/rua_state.json").string();
+}
+
+fs::path rua::rua_resource_dir() const
+{
+    return fs::path(resource_dir_) / "rua";
+}
+
+void rua::sync_dirs_from_bot(const bot *p)
+{
+    if (p == nullptr) {
+        return;
+    }
+    const std::string new_cfg = p->getConfigDir();
+    const std::string new_res = p->getResourceDir();
+    if (new_cfg == config_dir_ && new_res == resource_dir_) {
+        return;
+    }
+    config_dir_ = new_cfg;
+    resource_dir_ = new_res;
+    fs::create_directories(rua_resource_dir());
+    load_config();
+    load_favor_text_config();
+    load_favor_storage();
+    load_daily_limit_storage();
+}
+
+void rua::load_config()
+{
+    items_.clear();
+    random_favor_mode_ = false;
+
+    Json::Value root = string_to_json(readfile(rua_config_path(), "[]"));
+    Json::Value arr = root;
+    if (root.isObject() && root.isMember("items") && root["items"].isArray()) {
+        arr = root["items"];
+    }
+
+    if (!arr.isArray()) {
+        return;
+    }
+
+    for (const auto &item : arr) {
+        if (!item.isObject()) {
+            continue;
+        }
+
+        rua_item one;
+        one.name = trim(item.get("name", "").asString());
+        one.description = trim(item.get("description", "").asString());
+        one.image = trim(item.get("image", "").asString());
+        one.favor = item.isMember("favor") ? item["favor"].asInt()
+                                           : item.get("val", 0).asInt();
+
+        if (one.name.empty()) {
+            continue;
+        }
+
+        items_.push_back(one);
+    }
+
+    if (!items_.empty()) {
+        recompute_random_mode_unlocked();
+    }
+}
+
+void rua::save_config_unlocked() const
+{
+    Json::Value arr(Json::arrayValue);
+    for (const auto &it : items_) {
+        Json::Value J(Json::objectValue);
+        J["name"] = it.name;
+        J["description"] = it.description;
+        J["image"] = it.image;
+        J["favor"] = it.favor;
+        arr.append(J);
+    }
+
+    Json::Value root = string_to_json(readfile(rua_config_path(), "{}"));
+    if (!root.isObject()) {
+        root = Json::Value(Json::objectValue);
+    }
+    root["items"] = arr;
+    writefile(rua_config_path(), root.toStyledString(), false);
+}
+
+void rua::load_favor_text_config()
+{
+    favor_text_levels_.clear();
+
+    auto parse_levels = [&](const Json::Value &root) {
+        Json::Value arr;
+        if (root.isObject() && root.isMember("levels") &&
+            root["levels"].isArray()) {
+            arr = root["levels"];
+        }
+        if (!arr.isArray()) {
+            return;
+        }
+
+        for (const auto &it : arr) {
+            if (!it.isObject()) {
+                continue;
+            }
+
+            favor_text_level one;
+            one.min = it.get("min", 0).asInt();
+            one.hearts = trim(it.get("hearts", "♡").asString());
+
+            // New schema: one shared text pool for both query and draw.
+            if (it.isMember("texts") && it["texts"].isArray()) {
+                for (const auto &t : it["texts"]) {
+                    std::string s = trim(t.asString());
+                    if (!s.empty()) {
+                        one.texts.push_back(s);
+                    }
+                }
+            }
+
+            // Backward compatibility with old query/draw schema.
+            auto push_if = [&](const Json::Value &arrv) {
+                if (!arrv.isArray()) {
+                    return;
+                }
+                for (const auto &x : arrv) {
+                    std::string s = trim(x.asString());
+                    if (!s.empty()) {
+                        one.texts.push_back(s);
+                    }
+                }
+            };
+            std::string query_text = trim(it.get("query", "").asString());
+            std::string draw_text = trim(it.get("draw", "").asString());
+            if (!query_text.empty()) {
+                one.texts.push_back(query_text);
+            }
+            if (!draw_text.empty()) {
+                one.texts.push_back(draw_text);
+            }
+            push_if(it["query_alt"]);
+            push_if(it["draw_alt"]);
+
+            if (one.texts.empty()) {
+                continue;
+            }
+
+            if (one.hearts.empty()) {
+                one.hearts = "♡";
+            }
+            favor_text_levels_.push_back(one);
+        }
+    };
+
+    Json::Value root = string_to_json(readfile(rua_config_path(), "{}"));
+    parse_levels(root);
+    if (favor_text_levels_.empty()) {
+        Json::Value fallback_root(Json::objectValue);
+        if (root.isObject() && root.isMember("levels_fallback") &&
+            root["levels_fallback"].isArray()) {
+            fallback_root["levels"] = root["levels_fallback"];
+        }
+        parse_levels(fallback_root);
+    }
+
+    if (favor_text_levels_.empty()) {
+        auto push_level = [&](int min, const std::string &hearts,
+                              std::initializer_list<std::string> texts) {
+            favor_text_level one;
+            one.min = min;
+            one.hearts = hearts;
+            one.texts.assign(texts.begin(), texts.end());
+            favor_text_levels_.push_back(std::move(one));
+        };
+
+        push_level(0, "♡",
+                   {"九二对咪还很陌生，正小心翼翼地保持距离。",
+                    "九二会悄悄观察咪，但还不敢主动靠近。",
+                    "九二现在更习惯安静地待在角落里。"});
+        push_level(40, "♡♡",
+                   {"九二开始记住咪的声音了。",
+                    "九二虽然紧张，但不再总是躲开咪。",
+                    "九二会在咪靠近时轻轻抬头看一眼。"});
+        push_level(100, "♡♡♡",
+                   {"九二对咪的戒备明显少了很多。",
+                    "九二已经愿意在咪身边多停留一会儿。",
+                    "九二的眼神里出现了一点点安心。"});
+        push_level(200, "♡♡♡♡",
+                   {"九二把咪当成可以依赖的人。",
+                    "在咪身边时，九二会放松下来。",
+                    "九二开始期待和咪一起度过今天。"});
+        push_level(350, "♡♡♡♡♡",
+                   {"九二会主动来找咪贴贴。", "九二对咪的亲近已经藏不住了。",
+                    "九二喜欢跟在咪身边转来转去。"});
+        push_level(550, "♡♡♡♡♡♡",
+                   {"九二很在意咪的一举一动。", "只要咪在，九二就会觉得安心。",
+                    "九二已经把咪当成最特别的人。"});
+        push_level(800, "♡♡♡♡♡♡♡",
+                   {"九二眼里只剩下咪，连尾巴都在开心摇晃。",
+                    "九二会第一时间跑来回应咪的呼唤。",
+                    "九二想把每天最好的心情都留给咪。"});
+        push_level(1200, "♡♡♡♡♡♡♡♡",
+                   {"九二把咪视作生命里独一无二的存在。",
+                    "九二只要待在咪身边，就会感到满满的幸福。",
+                    "九二与咪之间，已经是深深的双向依恋。"});
+    }
+
+    std::sort(favor_text_levels_.begin(), favor_text_levels_.end(),
+              [](const favor_text_level &a, const favor_text_level &b) {
+                  return a.min < b.min;
+              });
+}
+
+void rua::recompute_random_mode_unlocked()
+{
+    random_favor_mode_ = !items_.empty();
+    for (const auto &it : items_) {
+        if (it.favor != 1) {
+            random_favor_mode_ = false;
+            break;
+        }
+    }
+}
+
+void rua::load_favor_storage()
+{
+    favor_by_user_.clear();
+
+    Json::Value root = string_to_json(readfile(rua_state_path(), "{}"));
+    Json::Value J;
+    if (root.isObject() && root.isMember("favor") && root["favor"].isObject()) {
+        J = root["favor"];
+    }
+
+    for (const auto &key : J.getMemberNames()) {
+        userid_t uid = my_string2uint64(key);
+        favor_by_user_[uid] = J[key].asInt64();
+    }
+}
+
+void rua::save_favor_storage_unlocked() const
+{
+    Json::Value root = string_to_json(readfile(rua_state_path(), "{}"));
+    if (!root.isObject()) {
+        root = Json::Value(Json::objectValue);
+    }
+
+    Json::Value J(Json::objectValue);
+    for (const auto &kv : favor_by_user_) {
+        J[std::to_string(kv.first)] = (Json::Int64)kv.second;
+    }
+    root["favor"] = J;
+    writefile(rua_state_path(), root.toStyledString(), false);
+}
+
+void rua::load_daily_limit_storage()
+{
+    daily_rua_count_by_user_.clear();
+    daily_rua_date_ = today_date_string();
+
+    Json::Value root = string_to_json(readfile(rua_state_path(), "{}"));
+    Json::Value J;
+    if (root.isObject() && root.isMember("daily") && root["daily"].isObject()) {
+        J = root["daily"];
+    }
+
+    if (!J.isObject()) {
+        return;
+    }
+
+    if (J.isMember("date") && J["date"].isString()) {
+        daily_rua_date_ = J["date"].asString();
+    }
+    if (J.isMember("counts") && J["counts"].isObject()) {
+        for (const auto &k : J["counts"].getMemberNames()) {
+            daily_rua_count_by_user_[my_string2uint64(k)] =
+                J["counts"][k].asInt();
+        }
+    }
+
+    reset_daily_limit_if_needed_unlocked();
+}
+
+void rua::save_daily_limit_storage_unlocked() const
+{
+    Json::Value root = string_to_json(readfile(rua_state_path(), "{}"));
+    if (!root.isObject()) {
+        root = Json::Value(Json::objectValue);
+    }
+
+    Json::Value daily(Json::objectValue);
+    Json::Value counts(Json::objectValue);
+    for (const auto &kv : daily_rua_count_by_user_) {
+        counts[std::to_string(kv.first)] = kv.second;
+    }
+    daily["date"] = daily_rua_date_;
+    daily["counts"] = counts;
+    root["daily"] = daily;
+    writefile(rua_state_path(), root.toStyledString(), false);
+}
+
+void rua::reset_daily_limit_if_needed_unlocked()
+{
+    const std::string today = today_date_string();
+    if (daily_rua_date_ != today) {
+        daily_rua_date_ = today;
+        daily_rua_count_by_user_.clear();
+        save_daily_limit_storage_unlocked();
+    }
+}
+
+int rua::pick_favor_delta(const rua_item &item) const
+{
+    if (random_favor_mode_) {
+        // Temporary mode for all-1 datasets: generate a random positive gain.
+        return get_random(1, 6);
+    }
+    return item.favor;
+}
+
+const favor_text_level &rua::pick_favor_level(int64_t total) const
+{
+    if (favor_text_levels_.empty()) {
+        static const favor_text_level fallback{0, "♡", {"九二在发呆。"}};
+        return fallback;
+    }
+
+    const favor_text_level *ret = &favor_text_levels_.front();
+    for (const auto &lv : favor_text_levels_) {
+        if (total >= lv.min) {
+            ret = &lv;
+        }
+    }
+    return *ret;
+}
+
+std::string rua::pick_random_alt(const std::vector<std::string> &alts,
+                                 const std::string &fallback) const
+{
+    if (!alts.empty()) {
+        return alts[get_random((int)alts.size())];
+    }
+    return fallback;
+}
+
+std::string rua::format_query_favor_text(int64_t total) const
+{
+    const auto &lv = pick_favor_level(total);
+    std::ostringstream oss;
+    oss << "当前九二对咪的好感度：" << lv.hearts;
+    std::string line = pick_random_alt(lv.texts, "");
+    if (!line.empty()) {
+        oss << "\n" << line;
+    }
+    return oss.str();
+}
+
+std::string rua::format_draw_favor_text(int64_t total) const
+{
+    const auto &lv = pick_favor_level(total);
+    std::ostringstream oss;
+    oss << "当前九二对咪的好感度：" << lv.hearts;
+    std::string line = pick_random_alt(lv.texts, "");
+    if (!line.empty()) {
+        oss << "\n" << line;
+    }
+    return oss.str();
+}
+
+bool rua::is_admin(const msg_meta &conf) const
+{
+    if (conf.p->is_op(conf.user_id)) {
+        return true;
+    }
+    if (conf.message_type == "group") {
+        return is_group_op(conf.p, conf.group_id, conf.user_id);
+    }
+    return false;
+}
+
+int rua::find_item_index_by_name(const std::string &name) const
+{
+    for (size_t i = 0; i < items_.size(); ++i) {
+        if (items_[i].name == name) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+std::string rua::parse_image_url(std::string message,
+                                 const msg_meta &conf) const
+{
+    std::string img;
+    if (message.find("[CQ:reply") != std::string::npos) {
+        size_t pos = message.find("[CQ:reply,id=");
+        size_t end_pos = message.find("]", pos);
+        if (pos != std::string::npos && end_pos != std::string::npos) {
+            std::string reply_id_str =
+                message.substr(pos + 13, end_pos - (pos + 13));
+            int64_t reply_id = my_string2int64(reply_id_str);
+            Json::Value J;
+            J["message_id"] = reply_id;
+            std::string res = conf.p->cq_send("get_msg", J);
+            Json::Value res_json = string_to_json(res);
+            if (res_json.isMember("data") &&
+                res_json["data"].isMember("message")) {
+                std::string reply_message =
+                    messageArr_to_string(res_json["data"]["message"]);
+                size_t img_pos = reply_message.find("[CQ:image");
+                if (img_pos != std::string::npos) {
+                    size_t url_pos = reply_message.find(",url=", img_pos);
+                    if (url_pos != std::string::npos) {
+                        size_t start = url_pos + 5;
+                        size_t comma = reply_message.find(',', start);
+                        size_t bracket = reply_message.find(']', start);
+                        size_t end = std::min(
+                            comma == std::string::npos ? bracket : comma,
+                            bracket == std::string::npos ? comma : bracket);
+                        if (end != std::string::npos && end > start) {
+                            return reply_message.substr(start, end - start);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    size_t img_pos = message.find("[CQ:image");
+    if (img_pos != std::string::npos) {
+        size_t url_pos = message.find(",url=", img_pos);
+        if (url_pos != std::string::npos) {
+            size_t start = url_pos + 5;
+            size_t comma = message.find(',', start);
+            size_t bracket = message.find(']', start);
+            size_t end =
+                std::min(comma == std::string::npos ? bracket : comma,
+                         bracket == std::string::npos ? comma : bracket);
+            if (end != std::string::npos && end > start) {
+                img = message.substr(start, end - start);
+            }
+        }
+    }
+    return img;
+}
+
+std::string rua::save_image_from_message(const std::string &message,
+                                         const msg_meta &conf) const
+{
+    std::string url = parse_image_url(message, conf);
+    if (url.empty()) {
+        return "";
+    }
+
+    const std::string ext = pick_extension_from_url(url);
+    const std::string fname = generate_uuid() + ext;
+    download(cq_decode(url), rua_resource_dir().string() + "/", fname);
+    return fname;
+}
+
+std::pair<size_t, size_t> rua::target_image_size_from_kunkun() const
+{
+    constexpr size_t kDebugSafeMaxW = 240;
+    constexpr size_t kDebugSafeMaxH = 240;
+    for (const auto &it : items_) {
+        if (it.name != "困困九二") {
+            continue;
+        }
+        fs::path p = rua_resource_dir() / trim(it.image);
+        if (!fs::exists(p)) {
+            continue;
+        }
+        try {
+            Magick::Image img;
+            img.read(p.string());
+            if (img.columns() > 0 && img.rows() > 0) {
+                const size_t w =
+                    std::min<size_t>(img.columns(), kDebugSafeMaxW);
+                const size_t h = std::min<size_t>(img.rows(), kDebugSafeMaxH);
+                return {w, h};
+            }
+        }
+        catch (...) {
+        }
+    }
+    return {200, 200};
+}
+
+std::string rua::normalized_image_file(const std::string &raw_file,
+                                       bool refresh) const
+{
+    const std::string file = trim(raw_file);
+    if (file.empty()) {
+        return "";
+    }
+
+    fs::path src = rua_resource_dir() / file;
+    if (!fs::exists(src) || !fs::is_regular_file(src)) {
+        return "";
+    }
+
+    fs::path out_dir = rua_resource_dir() / ".normalized";
+    fs::create_directories(out_dir);
+    std::string ext = src.extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    const bool is_gif = (ext == ".gif");
+    fs::path out = out_dir / (src.stem().string() +
+                              (is_gif ? "_small.gif" : "_small.png"));
+
+    bool need_refresh = refresh || !fs::exists(out);
+    if (!need_refresh) {
+        std::error_code ec;
+        need_refresh =
+            fs::last_write_time(out, ec) < fs::last_write_time(src, ec);
+    }
+
+    if (need_refresh) {
+        try {
+            const auto [tw, th] = target_image_size_from_kunkun();
+
+            if (is_gif) {
+                std::list<Magick::Image> frames;
+                std::list<Magick::Image> coalesced;
+                Magick::readImages(&frames, src.string());
+                if (frames.empty()) {
+                    return "";
+                }
+                Magick::coalesceImages(&coalesced, frames.begin(),
+                                       frames.end());
+                if (coalesced.empty()) {
+                    return "";
+                }
+
+                const size_t w = coalesced.front().columns();
+                const size_t h = coalesced.front().rows();
+                if (w > 0 && h > 0 && (w > tw || h > th)) {
+                    const double ratio = std::min(
+                        static_cast<double>(tw) / static_cast<double>(w),
+                        static_cast<double>(th) / static_cast<double>(h));
+                    const size_t nw = std::max<size_t>(
+                        1, static_cast<size_t>(std::floor(w * ratio)));
+                    const size_t nh = std::max<size_t>(
+                        1, static_cast<size_t>(std::floor(h * ratio)));
+                    for (auto &frame : coalesced) {
+                        frame.resize(Magick::Geometry(nw, nh));
+                        frame.magick("GIF");
+                    }
+                }
+
+                std::list<Magick::Image> optimized;
+                Magick::optimizeImageLayers(&optimized, coalesced.begin(),
+                                            coalesced.end());
+                Magick::writeImages(optimized.begin(), optimized.end(),
+                                    out.string());
+            }
+            else {
+                Magick::Image img;
+                img.read(src.string());
+                size_t w = img.columns();
+                size_t h = img.rows();
+                if (w > 0 && h > 0 && (w > tw || h > th)) {
+                    const double ratio = std::min(
+                        static_cast<double>(tw) / static_cast<double>(w),
+                        static_cast<double>(th) / static_cast<double>(h));
+                    const size_t nw = std::max<size_t>(
+                        1, static_cast<size_t>(std::floor(w * ratio)));
+                    const size_t nh = std::max<size_t>(
+                        1, static_cast<size_t>(std::floor(h * ratio)));
+                    img.resize(Magick::Geometry(nw, nh));
+                }
+                img.write(out.string());
+            }
+        }
+        catch (...) {
+            return "";
+        }
+    }
+
+    return "file://" + fs::absolute(out).string();
+}
+
+std::string rua::resolve_image_file(const std::string &raw_file,
+                                    bool refresh_normalized) const
+{
+    std::string file = trim(raw_file);
+    if (file.empty()) {
+        return "";
+    }
+
+    if (starts_with(file, "http://") || starts_with(file, "https://") ||
+        starts_with(file, "file://") || starts_with(file, "base64://")) {
+        return file;
+    }
+
+    fs::path raw_path(file);
+    if (raw_path.is_absolute()) {
+        return "file://" + raw_path.string();
+    }
+
+    fs::path under_rua = rua_resource_dir() / raw_path;
+    if (fs::exists(under_rua)) {
+        std::string normalized =
+            normalized_image_file(raw_path.string(), refresh_normalized);
+        if (!normalized.empty()) {
+            return normalized;
+        }
+        return "file://" + fs::absolute(under_rua).string();
+    }
+
+    fs::path rel = fs::path("./") / raw_path;
+    if (fs::exists(rel)) {
+        return "file://" + fs::absolute(rel).string();
+    }
+
+    return "";
+}
+
+void rua::process(std::string message, const msg_meta &conf)
+{
+    std::string m = trim(message);
+    bool admin = is_admin(conf);
+
+    std::lock_guard<std::mutex> guard(mutex_);
+    sync_dirs_from_bot(conf.p);
+
+    if (m == "*rua.help" || m == "*rua帮助") {
+        help_level_t lv = help_level_t::public_only;
+        if (admin) {
+            lv = conf.p->is_op(conf.user_id) ? help_level_t::bot_admin
+                                             : help_level_t::group_admin;
+        }
+        conf.p->cq_send(help(conf, lv), conf);
+        return;
+    }
+
+    if (m == "*rua.reload") {
+        if (admin) {
+            load_config();
+            load_favor_text_config();
+            load_favor_storage();
+            load_daily_limit_storage();
+            conf.p->cq_send("rua 配置已重载", conf);
+        }
+        return;
+    }
+
+    if (m == "*rua.favor" || m == "*查询92好感度") {
+        int64_t total = 0;
+        auto it = favor_by_user_.find(conf.user_id);
+        if (it != favor_by_user_.end()) {
+            total = it->second;
+        }
+        conf.p->cq_send(format_query_favor_text(total), conf);
+        return;
+    }
+
+    if (admin && (m == "*rua.list" || m == "*92列表")) {
+        if (items_.empty()) {
+            conf.p->cq_send("rua 列表为空", conf);
+            return;
+        }
+
+        std::ostringstream oss;
+        oss << "rua 名称列表(" << items_.size() << "):\n";
+        for (size_t i = 0; i < items_.size(); ++i) {
+            oss << i + 1 << ". " << items_[i].name << "\n";
+        }
+        conf.p->cq_send(trim(oss.str()), conf);
+        return;
+    }
+
+    if (admin && (starts_with(m, CMD_GET_EN) || starts_with(m, CMD_GET_ZH))) {
+        std::string name = starts_with(m, CMD_GET_EN)
+                               ? trim(m.substr(std::string(CMD_GET_EN).size()))
+                               : trim(m.substr(std::string(CMD_GET_ZH).size()));
+        int idx = find_item_index_by_name(name);
+        if (idx < 0) {
+            conf.p->cq_send("未找到该 rua 名称", conf);
+            return;
+        }
+
+        const rua_item &it = items_[idx];
+        std::ostringstream oss;
+        oss << "name: " << it.name << "\n"
+            << "description: " << it.description << "\n"
+            << "image: " << it.image << "\n"
+            << "favor: " << it.favor;
+        const std::string image_ref = resolve_image_file(it.image, true);
+        if (!image_ref.empty()) {
+            oss << "\n[CQ:image,file=" << image_ref << ",id=40000]";
+        }
+        conf.p->cq_send(oss.str(), conf);
+        return;
+    }
+
+    if (admin && (starts_with(m, CMD_ADD_EN) || starts_with(m, CMD_ADD_ZH))) {
+        std::string payload =
+            starts_with(m, CMD_ADD_EN)
+                ? trim(m.substr(std::string(CMD_ADD_EN).size()))
+                : trim(m.substr(std::string(CMD_ADD_ZH).size()));
+        std::vector<std::string> parts = split_by_char(payload, '|');
+        if (parts.size() < 2) {
+            conf.p->cq_send(
+                "格式: *rua.add 名称|描述|favor(可选)，然后发送图片", conf);
+            return;
+        }
+
+        rua_item one;
+        one.name = trim(parts[0]);
+        one.description = trim(parts[1]);
+        one.favor = parts.size() >= 3 ? (int)my_string2int64(parts[2]) : 1;
+        if (one.name.empty()) {
+            conf.p->cq_send("名称不能为空", conf);
+            return;
+        }
+
+        std::string image_name;
+        try {
+            image_name = save_image_from_message(m, conf);
+        }
+        catch (...) {
+            conf.p->cq_send("图片下载失败，请重试", conf);
+            return;
+        }
+
+        if (image_name.empty()) {
+            pending_add_by_user_[conf.user_id] = one;
+            conf.p->cq_send("已记录条目，请直接发送图片或回复一条图片消息",
+                            conf);
+            return;
+        }
+
+        one.image = image_name;
+
+        int idx = find_item_index_by_name(one.name);
+        if (idx >= 0) {
+            items_[idx] = one;
+        }
+        else {
+            items_.push_back(one);
+        }
+
+        recompute_random_mode_unlocked();
+        save_config_unlocked();
+        pending_add_by_user_.erase(conf.user_id);
+        conf.p->cq_send(fmt::format("rua 已保存: {}", one.name), conf);
+        return;
+    }
+
+    if (admin && (starts_with(m, CMD_DEL_EN) || starts_with(m, CMD_DEL_ZH))) {
+        std::string name = starts_with(m, CMD_DEL_EN)
+                               ? trim(m.substr(std::string(CMD_DEL_EN).size()))
+                               : trim(m.substr(std::string(CMD_DEL_ZH).size()));
+        int idx = find_item_index_by_name(name);
+        if (idx < 0) {
+            conf.p->cq_send("未找到该 rua 名称", conf);
+            return;
+        }
+        items_.erase(items_.begin() + idx);
+
+        recompute_random_mode_unlocked();
+        save_config_unlocked();
+        conf.p->cq_send(fmt::format("rua 已删除: {}", name), conf);
+        return;
+    }
+
+    if (admin) {
+        auto pit = pending_add_by_user_.find(conf.user_id);
+        if (pit != pending_add_by_user_.end()) {
+            std::string image_name;
+            try {
+                image_name = save_image_from_message(m, conf);
+            }
+            catch (...) {
+                conf.p->cq_send("图片下载失败，请重试", conf);
+                return;
+            }
+
+            if (image_name.empty()) {
+                conf.p->cq_send("未检测到图片，请发送图片或回复一条图片消息",
+                                conf);
+                return;
+            }
+
+            rua_item one = pit->second;
+            one.image = image_name;
+            int idx = find_item_index_by_name(one.name);
+            if (idx >= 0) {
+                items_[idx] = one;
+            }
+            else {
+                items_.push_back(one);
+            }
+            recompute_random_mode_unlocked();
+            save_config_unlocked();
+            pending_add_by_user_.erase(pit);
+            conf.p->cq_send(fmt::format("rua 已保存: {}", one.name), conf);
+            return;
+        }
+    }
+
+    if (items_.empty()) {
+        conf.p->cq_send("rua 列表为空，请先编辑 " + rua_config_path(), conf);
+        return;
+    }
+
+    if (m != "*rua") {
+        return;
+    }
+
+    const rua_item &pick = items_[get_random((int)items_.size())];
+    const userid_t target = conf.user_id;
+    const bool op_debug_no_limit = conf.p->is_op(conf.user_id);
+
+    reset_daily_limit_if_needed_unlocked();
+    int &daily_count = daily_rua_count_by_user_[target];
+    if (!op_debug_no_limit && daily_count >= 1) {
+        conf.p->cq_send("今天已经rua过1次啦，明天再来贴贴~", conf);
+        return;
+    }
+
+    const int favor_delta = pick_favor_delta(pick);
+    const int64_t favor_total = (favor_by_user_[target] += favor_delta);
+    if (!op_debug_no_limit) {
+        ++daily_count;
+    }
+    save_favor_storage_unlocked();
+    if (!op_debug_no_limit) {
+        save_daily_limit_storage_unlocked();
+    }
+
+    std::ostringstream oss;
+    oss << "恭喜rua到了一只" << pick.name << "！\n";
+
+    const std::string image_ref = resolve_image_file(pick.image, true);
+    if (!image_ref.empty()) {
+        oss << "[CQ:image,file=" << image_ref << ",id=40000]";
+    }
+
+    oss << pick.name;
+    if (!pick.description.empty()) {
+        oss << "\n" << pick.description;
+    }
+    oss << "\n\n" << format_draw_favor_text(favor_total);
+
+    conf.p->cq_send(oss.str(), conf);
+    conf.p->setlog(
+        LOG::INFO,
+        fmt::format("rua at g{} u{} target{} picked {} favor {:+} total {}",
+                    conf.group_id, conf.user_id, target, pick.name, favor_delta,
+                    favor_total));
+}
+
+bool rua::check(std::string message, const msg_meta &conf)
+{
+    std::string m = trim(message);
+    if (starts_with(m, "*rua") || starts_with(m, "*添加92 ") ||
+        starts_with(m, "*删除92 ") || starts_with(m, "*查询92 ") ||
+        m == "*92列表" || m == "*查询92好感度") {
+        return true;
+    }
+
+    std::lock_guard<std::mutex> guard(mutex_);
+    return pending_add_by_user_.find(conf.user_id) !=
+           pending_add_by_user_.end();
+}
+
+std::string rua::help()
+{
+    return "九二rua：抽取互动并累计好感。详细帮助：*rua.help";
+}
+
+std::string rua::help(const msg_meta &conf, help_level_t level)
+{
+    (void)conf;
+    std::string base = rua_detail_help_public();
+    if (level == help_level_t::group_admin ||
+        level == help_level_t::bot_admin) {
+        return base + "\n"
+                      "管理员命令:\n"
+                      "*rua.reload\n"
+                      "*92列表\n"
+                      "*查询92 名称\n"
+                      "*添加92 名称|描述|favor(可选) 然后发送图片\n"
+                      "*删除92 名称\n"
+                      "*rua.add 名称|描述|favor(可选) 然后发送图片\n"
+                      "*rua.get 名称\n"
+                      "*rua.del 名称\n"
+                      "*rua.list";
+    }
+    return base;
+}
+
+DECLARE_FACTORY_FUNCTIONS(rua)
