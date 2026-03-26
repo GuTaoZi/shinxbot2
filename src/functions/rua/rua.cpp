@@ -72,6 +72,26 @@ std::string rua_detail_help_public()
            "配置文件: <config>/features/rua/rua.json\n"
            "状态文件: <config>/features/rua/rua_state.json";
 }
+
+std::string rua_detail_help(help_level_t level)
+{
+    std::string base = rua_detail_help_public();
+    if (level == help_level_t::group_admin ||
+        level == help_level_t::bot_admin) {
+        return base + "\n"
+                      "管理员命令:\n"
+                      "*rua.reload\n"
+                      "*92列表\n"
+                      "*查询92 名称\n"
+                      "*添加92 名称|描述|favor(可选) 然后发送图片\n"
+                      "*删除92 名称\n"
+                      "*rua.add 名称|描述|favor(可选) 然后发送图片\n"
+                      "*rua.get 名称\n"
+                      "*rua.del 名称\n"
+                      "*rua.list";
+    }
+    return base;
+}
 } // namespace
 
 rua::rua()
@@ -722,7 +742,7 @@ void rua::process(std::string message, const msg_meta &conf)
             lv = conf.p->is_op(conf.user_id) ? help_level_t::bot_admin
                                              : help_level_t::group_admin;
         }
-        conf.p->cq_send(help(conf, lv), conf);
+        conf.p->cq_send(rua_detail_help(lv), conf);
         return;
     }
 
@@ -966,22 +986,11 @@ std::string rua::help()
 std::string rua::help(const msg_meta &conf, help_level_t level)
 {
     (void)conf;
-    std::string base = rua_detail_help_public();
     if (level == help_level_t::group_admin ||
         level == help_level_t::bot_admin) {
-        return base + "\n"
-                      "管理员命令:\n"
-                      "*rua.reload\n"
-                      "*92列表\n"
-                      "*查询92 名称\n"
-                      "*添加92 名称|描述|favor(可选) 然后发送图片\n"
-                      "*删除92 名称\n"
-                      "*rua.add 名称|描述|favor(可选) 然后发送图片\n"
-                      "*rua.get 名称\n"
-                      "*rua.del 名称\n"
-                      "*rua.list";
+        return "九二rua：抽取互动并累计好感。帮助：*rua.help（含管理员命令）";
     }
-    return base;
+    return help();
 }
 
 DECLARE_FACTORY_FUNCTIONS(rua)
