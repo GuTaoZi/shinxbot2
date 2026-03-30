@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <map>
 #include <mutex>
+#include <set>
 #include <vector>
 
 struct rua_item {
@@ -59,6 +60,7 @@ private:
     std::string save_image_from_message(const std::string &message,
                                         const msg_meta &conf) const;
     std::pair<size_t, size_t> target_image_size_from_kunkun() const;
+    void cleanup_orphan_images_unlocked();
     std::string normalized_image_file(const std::string &raw_file,
                                       bool refresh) const;
     std::string resolve_image_file(const std::string &raw_file,
@@ -68,6 +70,7 @@ public:
     rua();
     void process(std::string message, const msg_meta &conf);
     bool check(std::string message, const msg_meta &conf);
+    bool reload(const msg_meta &conf) override;
     std::string help();
     std::string help(const msg_meta &conf, help_level_t level);
 };
