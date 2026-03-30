@@ -17,12 +17,6 @@ constexpr const char *CMD_ADD_ZH = "*添加92 ";
 constexpr const char *CMD_DEL_EN = "*rua.del ";
 constexpr const char *CMD_DEL_ZH = "*删除92 ";
 
-bool starts_with(const std::string &s, const std::string &prefix)
-{
-    return s.size() >= prefix.size() &&
-           s.compare(0, prefix.size(), prefix) == 0;
-}
-
 std::vector<std::string> split_by_char(const std::string &s, char delim)
 {
     std::vector<std::string> out;
@@ -53,6 +47,52 @@ std::string pick_extension_from_url(const std::string &url)
         return ".png";
     }
     return ext;
+}
+
+std::string extract_cq_param_from_message(const std::string &message,
+                                          const std::string &key)
+{
+    const std::string token = "," + key + "=";
+    size_t img_pos = message.find("[CQ:image");
+    if (img_pos == std::string::npos) {
+        return "";
+    }
+
+    size_t key_pos = message.find(token, img_pos);
+    if (key_pos == std::string::npos) {
+        return "";
+    }
+
+    const size_t start = key_pos + token.size();
+    const size_t comma = message.find(',', start);
+    const size_t bracket = message.find(']', start);
+    const size_t end = std::min(comma == std::string::npos ? bracket : comma,
+                                bracket == std::string::npos ? comma : bracket);
+    if (end == std::string::npos || end <= start) {
+        return "";
+    }
+    return message.substr(start, end - start);
+}
+
+std::string pick_extension_from_magick_format(std::string fmt)
+{
+    std::transform(fmt.begin(), fmt.end(), fmt.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+
+    if (fmt == "gif") {
+        return ".gif";
+    }
+    if (fmt == "jpeg" || fmt == "jpg") {
+        return ".jpg";
+    }
+    if (fmt == "png") {
+        return ".png";
+    }
+    if (fmt == "webp") {
+        return ".webp";
+    }
+    return "";
 }
 
 std::string today_date_string()
@@ -106,6 +146,17 @@ rua::rua()
 std::string rua::rua_config_path() const
 {
     return (fs::path(config_dir_) / "features/rua/rua.json").string();
+}
+
+bool rua::reload(const msg_meta &conf)
+{
+    std::lock_guard<std::mutex> guard(mutex_);
+    sync_dirs_from_bot(conf.p);
+    load_config();
+    load_favor_text_config();
+    load_favor_storage();
+    load_daily_limit_storage();
+    return true;
 }
 
 std::string rua::rua_state_path() const
@@ -563,38 +614,103 @@ std::string rua::save_image_from_message(const std::string &message,
         return "";
     }
 
-    const std::string ext = pick_extension_from_url(url);
-    const std::string fname = generate_uuid() + ext;
-    download(cq_decode(url), rua_resource_dir().string() + "/", fname);
+    const std::string fallback_file =
+        extract_cq_param_from_message(message, "file");
+    std::string ext = pick_extension_from_url(url);
+    if (ext == ".png" && !fallback_file.empty()) {
+        const std::string ext_from_file =
+            pick_extension_from_url(fallback_file);
+        if (!ext_from_file.empty() && ext_from_file != ".png") {
+            ext = ext_from_file;
+        }
+    }
+
+    const std::string id = generate_uuid();
+    const std::string tmp_name = id + ".tmp";
+    const fs::path tmp_path = rua_resource_dir() / tmp_name;
+    download(cq_decode(url), rua_resource_dir().string() + "/", tmp_name);
+
+    std::string real_ext;
+    try {
+        Magick::Image img;
+        img.read(tmp_path.string());
+        real_ext = pick_extension_from_magick_format(img.magick());
+    }
+    catch (...) {
+    }
+
+    if (real_ext.empty()) {
+        real_ext = ext.empty() ? ".png" : ext;
+    }
+
+    const std::string fname = id + real_ext;
+    const fs::path final_path = rua_resource_dir() / fname;
+    std::error_code ec;
+    fs::rename(tmp_path, final_path, ec);
+    if (ec) {
+        fs::copy_file(tmp_path, final_path,
+                      fs::copy_options::overwrite_existing, ec);
+        fs::remove(tmp_path, ec);
+    }
     return fname;
 }
 
 std::pair<size_t, size_t> rua::target_image_size_from_kunkun() const
 {
-    constexpr size_t kDebugSafeMaxW = 240;
-    constexpr size_t kDebugSafeMaxH = 240;
+    // Keep anti-spam behavior while avoiding heavy blur from tiny downsizing.
+    return {520, 520};
+}
+
+void rua::cleanup_orphan_images_unlocked()
+{
+    std::set<std::string> referenced;
     for (const auto &it : items_) {
-        if (it.name != "困困九二") {
+        const std::string f = trim(it.image);
+        if (f.empty()) {
             continue;
         }
-        fs::path p = rua_resource_dir() / trim(it.image);
-        if (!fs::exists(p)) {
+        if (starts_with(f, "http://") || starts_with(f, "https://") ||
+            starts_with(f, "file://") || starts_with(f, "base64://")) {
             continue;
         }
-        try {
-            Magick::Image img;
-            img.read(p.string());
-            if (img.columns() > 0 && img.rows() > 0) {
-                const size_t w =
-                    std::min<size_t>(img.columns(), kDebugSafeMaxW);
-                const size_t h = std::min<size_t>(img.rows(), kDebugSafeMaxH);
-                return {w, h};
+        fs::path p(f);
+        if (p.is_absolute()) {
+            continue;
+        }
+        referenced.insert(p.filename().string());
+    }
+
+    const fs::path root = rua_resource_dir();
+    if (!fs::exists(root)) {
+        return;
+    }
+
+    const fs::path normalized_dir = root / ".normalized";
+    std::error_code ec;
+    for (const auto &entry : fs::directory_iterator(root, ec)) {
+        if (ec) {
+            break;
+        }
+        if (!(entry.is_regular_file() || entry.is_symlink())) {
+            continue;
+        }
+
+        const std::string filename = entry.path().filename().string();
+        if (referenced.find(filename) != referenced.end()) {
+            continue;
+        }
+
+        fs::remove(entry.path(), ec);
+        ec.clear();
+
+        const std::string stem = entry.path().stem().string();
+        if (fs::exists(normalized_dir)) {
+            for (const auto &ext : {".png", ".gif", ".jpg", ".webp"}) {
+                fs::remove(normalized_dir / (stem + "_small" + ext), ec);
+                ec.clear();
             }
         }
-        catch (...) {
-        }
     }
-    return {200, 200};
 }
 
 std::string rua::normalized_image_file(const std::string &raw_file,
@@ -655,6 +771,7 @@ std::string rua::normalized_image_file(const std::string &raw_file,
                     const size_t nh = std::max<size_t>(
                         1, static_cast<size_t>(std::floor(h * ratio)));
                     for (auto &frame : coalesced) {
+                        frame.filterType(Magick::LanczosFilter);
                         frame.resize(Magick::Geometry(nw, nh));
                         frame.magick("GIF");
                     }
@@ -679,6 +796,7 @@ std::string rua::normalized_image_file(const std::string &raw_file,
                         1, static_cast<size_t>(std::floor(w * ratio)));
                     const size_t nh = std::max<size_t>(
                         1, static_cast<size_t>(std::floor(h * ratio)));
+                    img.filterType(Magick::LanczosFilter);
                     img.resize(Magick::Geometry(nw, nh));
                 }
                 img.write(out.string());
@@ -855,6 +973,7 @@ void rua::process(std::string message, const msg_meta &conf)
 
         recompute_random_mode_unlocked();
         save_config_unlocked();
+        cleanup_orphan_images_unlocked();
         pending_add_by_user_.erase(conf.user_id);
         conf.p->cq_send(fmt::format("rua 已保存: {}", one.name), conf);
         return;
@@ -873,6 +992,7 @@ void rua::process(std::string message, const msg_meta &conf)
 
         recompute_random_mode_unlocked();
         save_config_unlocked();
+        cleanup_orphan_images_unlocked();
         conf.p->cq_send(fmt::format("rua 已删除: {}", name), conf);
         return;
     }
@@ -906,6 +1026,7 @@ void rua::process(std::string message, const msg_meta &conf)
             }
             recompute_random_mode_unlocked();
             save_config_unlocked();
+            cleanup_orphan_images_unlocked();
             pending_add_by_user_.erase(pit);
             conf.p->cq_send(fmt::format("rua 已保存: {}", one.name), conf);
             return;
