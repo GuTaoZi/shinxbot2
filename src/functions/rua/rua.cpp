@@ -10,12 +10,21 @@
 #include <sstream>
 
 namespace {
-constexpr const char *CMD_GET_EN = "*rua.get ";
-constexpr const char *CMD_GET_ZH = "*查询92 ";
-constexpr const char *CMD_ADD_EN = "*rua.add ";
-constexpr const char *CMD_ADD_ZH = "*添加92 ";
-constexpr const char *CMD_DEL_EN = "*rua.del ";
-constexpr const char *CMD_DEL_ZH = "*删除92 ";
+constexpr const char *CMD_HELP = "*rua.help";
+constexpr const char *CMD_RELOAD = "*rua.reload";
+constexpr const char *CMD_FAVOR_EN = "*rua.favor";
+constexpr const char *CMD_FAVOR_ZH = "*查询92好感度";
+constexpr const char *CMD_LIST = "*rua.list";
+constexpr const char *CMD_DRAW = "*rua";
+constexpr const char *CMD_GET = "*rua.get ";
+constexpr const char *CMD_ADD = "*rua.add ";
+constexpr const char *CMD_DEL = "*rua.del ";
+
+bool is_external_image_ref(const std::string &path)
+{
+    return cmd_match_prefix(path,
+                            {"http://", "https://", "file://", "base64://"});
+}
 
 std::vector<std::string> split_by_char(const std::string &s, char delim)
 {
@@ -108,9 +117,7 @@ std::string rua_detail_help_public()
 {
     return "*rua: 随机rua一只九二\n"
            "*查询92好感度: 查看九二好感\n"
-           "*rua.help: 查看帮助\n"
-           "配置文件: <config>/features/rua/rua.json\n"
-           "状态文件: <config>/features/rua/rua_state.json";
+           "*rua.help: 查看帮助";
 }
 
 std::string rua_detail_help(help_level_t level)
@@ -121,10 +128,6 @@ std::string rua_detail_help(help_level_t level)
         return base + "\n"
                       "管理员命令:\n"
                       "*rua.reload\n"
-                      "*92列表\n"
-                      "*查询92 名称\n"
-                      "*添加92 名称|描述|favor(可选) 然后发送图片\n"
-                      "*删除92 名称\n"
                       "*rua.add 名称|描述|favor(可选) 然后发送图片\n"
                       "*rua.get 名称\n"
                       "*rua.del 名称\n"
@@ -669,8 +672,7 @@ void rua::cleanup_orphan_images_unlocked()
         if (f.empty()) {
             continue;
         }
-        if (starts_with(f, "http://") || starts_with(f, "https://") ||
-            starts_with(f, "file://") || starts_with(f, "base64://")) {
+        if (is_external_image_ref(f)) {
             continue;
         }
         fs::path p(f);
@@ -818,8 +820,7 @@ std::string rua::resolve_image_file(const std::string &raw_file,
         return "";
     }
 
-    if (starts_with(file, "http://") || starts_with(file, "https://") ||
-        starts_with(file, "file://") || starts_with(file, "base64://")) {
+    if (is_external_image_ref(file)) {
         return file;
     }
 
@@ -854,60 +855,13 @@ void rua::process(std::string message, const msg_meta &conf)
     std::lock_guard<std::mutex> guard(mutex_);
     sync_dirs_from_bot(conf.p);
 
-    if (m == "*rua.help" || m == "*rua帮助") {
-        help_level_t lv = help_level_t::public_only;
-        if (admin) {
-            lv = conf.p->is_op(conf.user_id) ? help_level_t::bot_admin
-                                             : help_level_t::group_admin;
-        }
-        conf.p->cq_send(rua_detail_help(lv), conf);
-        return;
-    }
+    const cmd_middleware_t admin_only = [admin]() { return admin; };
 
-    if (m == "*rua.reload") {
-        if (admin) {
-            load_config();
-            load_favor_text_config();
-            load_favor_storage();
-            load_daily_limit_storage();
-            conf.p->cq_send("rua 配置已重载", conf);
-        }
-        return;
-    }
-
-    if (m == "*rua.favor" || m == "*查询92好感度") {
-        int64_t total = 0;
-        auto it = favor_by_user_.find(conf.user_id);
-        if (it != favor_by_user_.end()) {
-            total = it->second;
-        }
-        conf.p->cq_send(format_query_favor_text(total), conf);
-        return;
-    }
-
-    if (admin && (m == "*rua.list" || m == "*92列表")) {
-        if (items_.empty()) {
-            conf.p->cq_send("rua 列表为空", conf);
-            return;
-        }
-
-        std::ostringstream oss;
-        oss << "rua 名称列表(" << items_.size() << "):\n";
-        for (size_t i = 0; i < items_.size(); ++i) {
-            oss << i + 1 << ". " << items_[i].name << "\n";
-        }
-        conf.p->cq_send(trim(oss.str()), conf);
-        return;
-    }
-
-    if (admin && (starts_with(m, CMD_GET_EN) || starts_with(m, CMD_GET_ZH))) {
-        std::string name = starts_with(m, CMD_GET_EN)
-                               ? trim(m.substr(std::string(CMD_GET_EN).size()))
-                               : trim(m.substr(std::string(CMD_GET_ZH).size()));
+    auto handle_get = [&](const std::string &name) {
         int idx = find_item_index_by_name(name);
         if (idx < 0) {
             conf.p->cq_send("未找到该 rua 名称", conf);
-            return;
+            return true;
         }
 
         const rua_item &it = items_[idx];
@@ -921,19 +875,15 @@ void rua::process(std::string message, const msg_meta &conf)
             oss << "\n[CQ:image,file=" << image_ref << ",id=40000]";
         }
         conf.p->cq_send(oss.str(), conf);
-        return;
-    }
+        return true;
+    };
 
-    if (admin && (starts_with(m, CMD_ADD_EN) || starts_with(m, CMD_ADD_ZH))) {
-        std::string payload =
-            starts_with(m, CMD_ADD_EN)
-                ? trim(m.substr(std::string(CMD_ADD_EN).size()))
-                : trim(m.substr(std::string(CMD_ADD_ZH).size()));
+    auto handle_add = [&](const std::string &payload) {
         std::vector<std::string> parts = split_by_char(payload, '|');
         if (parts.size() < 2) {
             conf.p->cq_send(
                 "格式: *rua.add 名称|描述|favor(可选)，然后发送图片", conf);
-            return;
+            return true;
         }
 
         rua_item one;
@@ -942,7 +892,7 @@ void rua::process(std::string message, const msg_meta &conf)
         one.favor = parts.size() >= 3 ? (int)my_string2int64(parts[2]) : 1;
         if (one.name.empty()) {
             conf.p->cq_send("名称不能为空", conf);
-            return;
+            return true;
         }
 
         std::string image_name;
@@ -951,18 +901,17 @@ void rua::process(std::string message, const msg_meta &conf)
         }
         catch (...) {
             conf.p->cq_send("图片下载失败，请重试", conf);
-            return;
+            return true;
         }
 
         if (image_name.empty()) {
             pending_add_by_user_[conf.user_id] = one;
             conf.p->cq_send("已记录条目，请直接发送图片或回复一条图片消息",
                             conf);
-            return;
+            return true;
         }
 
         one.image = image_name;
-
         int idx = find_item_index_by_name(one.name);
         if (idx >= 0) {
             items_[idx] = one;
@@ -976,17 +925,14 @@ void rua::process(std::string message, const msg_meta &conf)
         cleanup_orphan_images_unlocked();
         pending_add_by_user_.erase(conf.user_id);
         conf.p->cq_send(fmt::format("rua 已保存: {}", one.name), conf);
-        return;
-    }
+        return true;
+    };
 
-    if (admin && (starts_with(m, CMD_DEL_EN) || starts_with(m, CMD_DEL_ZH))) {
-        std::string name = starts_with(m, CMD_DEL_EN)
-                               ? trim(m.substr(std::string(CMD_DEL_EN).size()))
-                               : trim(m.substr(std::string(CMD_DEL_ZH).size()));
+    auto handle_del = [&](const std::string &name) {
         int idx = find_item_index_by_name(name);
         if (idx < 0) {
             conf.p->cq_send("未找到该 rua 名称", conf);
-            return;
+            return true;
         }
         items_.erase(items_.begin() + idx);
 
@@ -994,6 +940,153 @@ void rua::process(std::string message, const msg_meta &conf)
         save_config_unlocked();
         cleanup_orphan_images_unlocked();
         conf.p->cq_send(fmt::format("rua 已删除: {}", name), conf);
+        return true;
+    };
+
+    auto handle_draw = [&]() {
+        if (items_.empty()) {
+            conf.p->cq_send("rua 列表为空，请先编辑 " + rua_config_path(),
+                            conf);
+            return true;
+        }
+
+        const rua_item &pick = items_[get_random((int)items_.size())];
+        const userid_t target = conf.user_id;
+        const bool op_debug_no_limit = conf.p->is_op(conf.user_id);
+
+        reset_daily_limit_if_needed_unlocked();
+        int &daily_count = daily_rua_count_by_user_[target];
+        if (!op_debug_no_limit && daily_count >= 1) {
+            conf.p->cq_send("今天已经rua过1次啦，明天再来贴贴~", conf);
+            return true;
+        }
+
+        const int favor_delta = pick_favor_delta(pick);
+        const int64_t favor_total = (favor_by_user_[target] += favor_delta);
+        if (!op_debug_no_limit) {
+            ++daily_count;
+        }
+        save_favor_storage_unlocked();
+        if (!op_debug_no_limit) {
+            save_daily_limit_storage_unlocked();
+        }
+
+        std::ostringstream oss;
+        oss << "恭喜rua到了一只" << pick.name << "！\n";
+
+        const std::string image_ref = resolve_image_file(pick.image, true);
+        if (!image_ref.empty()) {
+            oss << "[CQ:image,file=" << image_ref << ",id=40000]";
+        }
+
+        oss << pick.name;
+        if (!pick.description.empty()) {
+            oss << "\n" << pick.description;
+        }
+        oss << "\n\n" << format_draw_favor_text(favor_total);
+
+        conf.p->cq_send(oss.str(), conf);
+        conf.p->setlog(
+            LOG::INFO,
+            fmt::format("rua at g{} u{} target{} picked {} favor {:+} total {}",
+                        conf.group_id, conf.user_id, target, pick.name,
+                        favor_delta, favor_total));
+        return true;
+    };
+
+    const std::vector<cmd_exact_rule> exact_rules = {
+        {CMD_HELP,
+         [&]() {
+             help_level_t lv = help_level_t::public_only;
+             if (admin) {
+                 lv = conf.p->is_op(conf.user_id) ? help_level_t::bot_admin
+                                                  : help_level_t::group_admin;
+             }
+             conf.p->cq_send(rua_detail_help(lv), conf);
+             return true;
+         }},
+        {CMD_RELOAD,
+         [&]() {
+             load_config();
+             load_favor_text_config();
+             load_favor_storage();
+             load_daily_limit_storage();
+             conf.p->cq_send("rua 配置已重载", conf);
+             return true;
+         },
+         {admin_only}},
+        {CMD_FAVOR_EN,
+         [&]() {
+             int64_t total = 0;
+             auto it = favor_by_user_.find(conf.user_id);
+             if (it != favor_by_user_.end()) {
+                 total = it->second;
+             }
+             conf.p->cq_send(format_query_favor_text(total), conf);
+             return true;
+         }},
+        {CMD_FAVOR_ZH,
+         [&]() {
+             int64_t total = 0;
+             auto it = favor_by_user_.find(conf.user_id);
+             if (it != favor_by_user_.end()) {
+                 total = it->second;
+             }
+             conf.p->cq_send(format_query_favor_text(total), conf);
+             return true;
+         }},
+        {CMD_LIST,
+         [&]() {
+             if (items_.empty()) {
+                 conf.p->cq_send("rua 列表为空", conf);
+                 return true;
+             }
+
+             std::ostringstream oss;
+             oss << "rua 名称列表(" << items_.size() << "):\n";
+             for (size_t i = 0; i < items_.size(); ++i) {
+                 oss << i + 1 << ". " << items_[i].name << "\n";
+             }
+             conf.p->cq_send(trim(oss.str()), conf);
+             return true;
+         },
+         {admin_only}},
+        {CMD_DRAW, handle_draw},
+    };
+
+    const std::vector<cmd_prefix_rule> prefix_rules = {
+        {CMD_GET,
+         [&]() {
+             std::string name;
+             if (!cmd_strip_prefix(m, CMD_GET, name)) {
+                 return false;
+             }
+             return handle_get(name);
+         },
+         {admin_only}},
+        {CMD_ADD,
+         [&]() {
+             std::string payload;
+             if (!cmd_strip_prefix(m, CMD_ADD, payload)) {
+                 return false;
+             }
+             return handle_add(payload);
+         },
+         {admin_only}},
+        {CMD_DEL,
+         [&]() {
+             std::string name;
+             if (!cmd_strip_prefix(m, CMD_DEL, name)) {
+                 return false;
+             }
+             return handle_del(name);
+         },
+         {admin_only}},
+    };
+
+    bool handled = false;
+    (void)cmd_try_dispatch(m, exact_rules, prefix_rules, handled);
+    if (handled) {
         return;
     }
 
@@ -1035,62 +1128,15 @@ void rua::process(std::string message, const msg_meta &conf)
 
     if (items_.empty()) {
         conf.p->cq_send("rua 列表为空，请先编辑 " + rua_config_path(), conf);
-        return;
     }
-
-    if (m != "*rua") {
-        return;
-    }
-
-    const rua_item &pick = items_[get_random((int)items_.size())];
-    const userid_t target = conf.user_id;
-    const bool op_debug_no_limit = conf.p->is_op(conf.user_id);
-
-    reset_daily_limit_if_needed_unlocked();
-    int &daily_count = daily_rua_count_by_user_[target];
-    if (!op_debug_no_limit && daily_count >= 1) {
-        conf.p->cq_send("今天已经rua过1次啦，明天再来贴贴~", conf);
-        return;
-    }
-
-    const int favor_delta = pick_favor_delta(pick);
-    const int64_t favor_total = (favor_by_user_[target] += favor_delta);
-    if (!op_debug_no_limit) {
-        ++daily_count;
-    }
-    save_favor_storage_unlocked();
-    if (!op_debug_no_limit) {
-        save_daily_limit_storage_unlocked();
-    }
-
-    std::ostringstream oss;
-    oss << "恭喜rua到了一只" << pick.name << "！\n";
-
-    const std::string image_ref = resolve_image_file(pick.image, true);
-    if (!image_ref.empty()) {
-        oss << "[CQ:image,file=" << image_ref << ",id=40000]";
-    }
-
-    oss << pick.name;
-    if (!pick.description.empty()) {
-        oss << "\n" << pick.description;
-    }
-    oss << "\n\n" << format_draw_favor_text(favor_total);
-
-    conf.p->cq_send(oss.str(), conf);
-    conf.p->setlog(
-        LOG::INFO,
-        fmt::format("rua at g{} u{} target{} picked {} favor {:+} total {}",
-                    conf.group_id, conf.user_id, target, pick.name, favor_delta,
-                    favor_total));
 }
 
 bool rua::check(std::string message, const msg_meta &conf)
 {
     std::string m = trim(message);
-    if (starts_with(m, "*rua") || starts_with(m, "*添加92 ") ||
-        starts_with(m, "*删除92 ") || starts_with(m, "*查询92 ") ||
-        m == "*92列表" || m == "*查询92好感度") {
+    if (cmd_match_prefix(m, {CMD_DRAW, CMD_GET, CMD_ADD, CMD_DEL}) ||
+        cmd_match_exact(
+            m, {CMD_HELP, CMD_RELOAD, CMD_FAVOR_EN, CMD_FAVOR_ZH, CMD_LIST})) {
         return true;
     }
 
