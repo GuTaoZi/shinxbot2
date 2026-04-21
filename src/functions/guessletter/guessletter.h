@@ -66,6 +66,8 @@ private:
     std::string render_board(const session &s, const msg_meta &conf) const;
     std::string render_scoreboard(const session &s, const msg_meta &conf) const;
     std::string render_opened_letters(const session &s) const;
+    void send_board(const session &s, const msg_meta &conf,
+                    const std::string &extra_prefix = "") const;
     std::vector<question> build_questions(const session &s) const;
     void advance_turn(session &s);
     bool all_solved(const session &s) const;

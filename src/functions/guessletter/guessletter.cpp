@@ -96,6 +96,7 @@ std::string guessletter_detail_help()
            "*kai start: 开始游戏\n"
            "*kai open <letter>: 开字母\n"
            "*kai guess <row> <answer>: 抢答某一题\n"
+           "*kai guess <answer>: 直接猜任意未解题\n"
            "*kai score: 查看本局积分榜\n"
            "*kai status: 查看题板\n"
            "*kai abort: 终止游戏\n"
@@ -287,6 +288,40 @@ std::string guessletter::render_opened_letters(const session &s) const
     return oss.str();
 }
 
+void guessletter::send_board(const session &s, const msg_meta &conf,
+                             const std::string &extra_prefix) const
+{
+    std::string board = render_board(s, conf);
+    if (!extra_prefix.empty()) {
+        board = extra_prefix + "\n" + board;
+    }
+
+    if (s.questions.size() > 10) {
+        Json::Value node;
+        node["type"] = "node";
+        node["data"]["name"] = "题板";
+        node["data"]["uin"] = "0";
+        node["data"]["content"] = board;
+
+        Json::Value msgs;
+        msgs.append(node);
+
+        Json::Value J;
+        J["messages"] = msgs;
+        if (conf.message_type == "group") {
+            J["group_id"] = conf.group_id;
+            conf.p->cq_send("send_group_forward_msg", J);
+        }
+        else {
+            J["user_id"] = conf.user_id;
+            conf.p->cq_send("send_private_forward_msg", J);
+        }
+    }
+    else {
+        conf.p->cq_send(board, conf);
+    }
+}
+
 std::string guessletter::render_scoreboard(const session &s,
                                            const msg_meta &conf) const
 {
@@ -459,7 +494,7 @@ void guessletter::process(std::string message, const msg_meta &conf)
         sessions_.erase(conf.group_id);
         session &ns = get_or_create_session(conf.group_id, conf.user_id);
         conf.p->cq_send("已创建房间，发送 *kai join 加入。", conf);
-        conf.p->cq_send(render_board(ns, conf), conf);
+        send_board(ns, conf);
         return;
     }
 
@@ -486,7 +521,7 @@ void guessletter::process(std::string message, const msg_meta &conf)
         s.last_open_at.clear();
         conf.p->cq_send("自由模式开始：无需加入，任何成员都可开字母或猜题。",
                         conf);
-        conf.p->cq_send(render_board(s, conf), conf);
+        send_board(s, conf);
         return;
     }
 
@@ -638,16 +673,16 @@ void guessletter::process(std::string message, const msg_meta &conf)
         s.free_mode = false;
         s.round_idx = 0;
         conf.p->cq_send("游戏开始：轮流开字母，任意玩家可抢答。", conf);
-        conf.p->cq_send(render_board(s, conf), conf);
+        send_board(s, conf);
         return;
     }
 
     if (lower_cmd == "status" || cmd == "状态") {
         if (!s.started) {
-            conf.p->cq_send("当前未开始。\n" + render_board(s, conf), conf);
+            send_board(s, conf, "当前未开始。");
         }
         else {
-            conf.p->cq_send(render_board(s, conf), conf);
+            send_board(s, conf);
         }
         return;
     }
@@ -689,7 +724,7 @@ void guessletter::process(std::string message, const msg_meta &conf)
             conf.p->cq_send("所有题目已结束。", conf);
             return;
         }
-        conf.p->cq_send(render_board(s, conf), conf);
+        send_board(s, conf);
         return;
     }
 
@@ -757,7 +792,7 @@ void guessletter::process(std::string message, const msg_meta &conf)
         }
         const std::string tip =
             opened ? "已开出该字母（全题同步）" : "该字母不存在或已全部打开";
-        conf.p->cq_send(tip + "\n" + render_board(s, conf), conf);
+        send_board(s, conf, tip);
         return;
     }
 
@@ -773,49 +808,98 @@ void guessletter::process(std::string message, const msg_meta &conf)
         std::string body = starts_with(lower_cmd, "guess ")
                                ? trim(cmd.substr(std::string("guess ").size()))
                                : trim(cmd.substr(2));
-        std::istringstream iss(body);
-        int row = 0;
-        iss >> row;
-        std::string answer;
-        std::getline(iss, answer);
-        answer = trim(answer);
-        row -= 1;
-        if (row < 0 || row >= (int)s.questions.size() || answer.empty()) {
-            conf.p->cq_send("用法: *kai guess <row> <answer>", conf);
-            return;
-        }
-        if (s.questions[row].solved) {
-            conf.p->cq_send("该题已解。", conf);
+        if (body.empty()) {
+            conf.p->cq_send(
+                "用法: *kai guess <row> <answer> 或 *kai guess <answer>", conf);
             return;
         }
 
-        bool solved = false;
-        for (const auto &cand : s.questions[row].accepted_answers) {
-            if (norm_answer(answer) == norm_answer(cand)) {
-                solved = true;
-                break;
+        auto all_digits = [](const std::string &s) {
+            return !s.empty() &&
+                   std::all_of(s.begin(), s.end(), [](unsigned char ch) {
+                       return std::isdigit(ch) != 0;
+                   });
+        };
+
+        int row = -1; // -1: direct-answer mode, try all unsolved questions.
+        std::string answer = body;
+        {
+            std::istringstream iss(body);
+            std::string first;
+            iss >> first;
+            if (all_digits(first)) {
+                row = (int)my_string2int64(first) - 1;
+                std::getline(iss, answer);
+                answer = trim(answer);
             }
         }
 
-        if (solved) {
-            s.questions[row].solved = true;
-            s.questions[row].shown = s.questions[row].key;
-            s.questions[row].solved_by = conf.user_id;
-            s.scores[conf.user_id] += 1;
-            conf.p->cq_send(fmt::format("回答正确！第 {} 题答案：{}", row + 1,
-                                        s.questions[row].answer),
-                            conf);
-            if (all_solved(s)) {
-                conf.p->cq_send(render_scoreboard(s, conf), conf);
-                sessions_.erase(conf.group_id);
-                conf.p->cq_send("全部题目已猜完，游戏结束。", conf);
+        if (answer.empty()) {
+            conf.p->cq_send(
+                "用法: *kai guess <row> <answer> 或 *kai guess <answer>", conf);
+            return;
+        }
+
+        const std::string want = norm_answer(answer);
+        auto row_match = [&](int idx) {
+            if (idx < 0 || idx >= (int)s.questions.size()) {
+                return false;
+            }
+            if (s.questions[idx].solved) {
+                return false;
+            }
+            for (const auto &cand : s.questions[idx].accepted_answers) {
+                if (want == norm_answer(cand)) {
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        int solved_row = -1;
+        if (row >= 0) {
+            if (row >= (int)s.questions.size()) {
+                conf.p->cq_send("题号无效。", conf);
                 return;
+            }
+            if (s.questions[row].solved) {
+                conf.p->cq_send("该题已解。", conf);
+                return;
+            }
+            if (row_match(row)) {
+                solved_row = row;
             }
         }
         else {
-            react_or_reply(conf, "424", "回答错误。");
+            for (int i = 0; i < (int)s.questions.size(); ++i) {
+                if (row_match(i)) {
+                    solved_row = i;
+                    break;
+                }
+            }
         }
-        conf.p->cq_send(render_board(s, conf), conf);
+
+        if (solved_row < 0) {
+            react_or_reply(conf, "424", "回答错误。");
+            return;
+        }
+
+        s.questions[solved_row].solved = true;
+        s.questions[solved_row].shown = s.questions[solved_row].key;
+        s.questions[solved_row].solved_by = conf.user_id;
+        s.scores[conf.user_id] += 1;
+        conf.p->cq_send(fmt::format("回答正确！第 {} 题答案：{}",
+                                    solved_row + 1,
+                                    s.questions[solved_row].answer),
+                        conf);
+        if (all_solved(s)) {
+            conf.p->cq_send(render_scoreboard(s, conf), conf);
+            sessions_.erase(conf.group_id);
+            conf.p->cq_send("全部题目已猜完，游戏结束。", conf);
+            return;
+        }
+
+        send_board(s, conf);
         return;
     }
 }

@@ -1029,8 +1029,9 @@ bool auto92::check(std::string message, const msg_meta &conf)
 {
     (void)conf;
     std::string m = trim(message);
-    return cmd_match_exact(m, {CMD_HELP, CMD_REBUILD}) ||
-           cmd_match_prefix(m, {CMD_PREFIX, CMD_PREFIX_COMPAT});
+    return cmd_match_exact(m, {CMD_HELP, CMD_REBUILD, CMD_CLEAR_CACHE}) ||
+           cmd_match_prefix(
+               m, {CMD_PRECOMPUTE_PREFIX, CMD_PREFIX, CMD_PREFIX_COMPAT});
 }
 
 std::string auto92::help()

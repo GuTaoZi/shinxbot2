@@ -986,11 +986,6 @@ void rua::process(std::string message, const msg_meta &conf)
         oss << "\n\n" << format_draw_favor_text(favor_total);
 
         conf.p->cq_send(oss.str(), conf);
-        conf.p->setlog(
-            LOG::INFO,
-            fmt::format("rua at g{} u{} target{} picked {} favor {:+} total {}",
-                        conf.group_id, conf.user_id, target, pick.name,
-                        favor_delta, favor_total));
         return true;
     };
 
@@ -1134,9 +1129,10 @@ void rua::process(std::string message, const msg_meta &conf)
 bool rua::check(std::string message, const msg_meta &conf)
 {
     std::string m = trim(message);
-    if (cmd_match_prefix(m, {CMD_DRAW, CMD_GET, CMD_ADD, CMD_DEL}) ||
-        cmd_match_exact(
-            m, {CMD_HELP, CMD_RELOAD, CMD_FAVOR_EN, CMD_FAVOR_ZH, CMD_LIST})) {
+    if (cmd_match_exact(m, {CMD_HELP, CMD_RELOAD, CMD_FAVOR_EN, CMD_FAVOR_ZH,
+                            CMD_LIST, CMD_DRAW}) ||
+        cmd_match_prefix(
+            m, {std::string(CMD_DRAW) + " ", CMD_GET, CMD_ADD, CMD_DEL})) {
         return true;
     }
 
