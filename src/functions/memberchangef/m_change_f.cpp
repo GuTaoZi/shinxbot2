@@ -179,7 +179,7 @@ void m_change_f::flush_welcome_queue(bot *p)
 
     for (const auto &item : pending) {
         msg_meta conf{"group", item.user_id, item.group_id, item.message_id,
-                    item.p != nullptr ? item.p : p};
+                      item.p != nullptr ? item.p : p};
 
         if (conf.p == nullptr) {
             continue;
