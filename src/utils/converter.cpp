@@ -75,7 +75,7 @@ std::string messageArr_to_string(const Json::Value &J) {
         std::string ret;
         Json::ArrayIndex sz = J.size();
         for (Json::ArrayIndex i = 0; i < sz; i++) {
-            ret += message_to_string(J[i], true);
+            ret += message_to_string(J[i], false);
         }
         return ret;
     } else {
