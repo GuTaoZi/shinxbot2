@@ -4,6 +4,8 @@
 #include <fstream>
 #include <iostream>
 #include <jsoncpp/json/json.h>
+#include <sstream>
+#include <stdexcept>
 
 std::fstream openfile(const fs::path file_path,
                       const std::ios_base::openmode mode) {
@@ -14,26 +16,21 @@ std::fstream openfile(const fs::path file_path,
     std::fstream file(file_path, mode);
     if (file.is_open()) {
         return file;
-    } else {
-        set_global_log(LOG::ERROR, "Cannot open file: " + file_path.string());
-        throw(file_path.string() + ": open file failed").c_str();
     }
+    set_global_log(LOG::ERROR, "Cannot open file: " + file_path.string());
+    throw std::runtime_error(file_path.string() + ": open file failed");
 }
 
 std::string readfile(const fs::path &file_path,
                      const std::string &default_content) {
-    std::ifstream afile;
-    afile.open(file_path, std::ios::in);
-
+    std::ifstream afile(file_path, std::ios::in);
     if (afile.is_open()) {
-        std::string ans, line;
-        while (!afile.eof()) {
-            getline(afile, line);
-            ans += line + "\n";
-        }
-        afile.close();
-        return ans;
-    } else {
+        std::ostringstream oss;
+        oss << afile.rdbuf();
+        return oss.str();
+    }
+
+    {
         set_global_log(LOG::WARNING,
                        "Reading file: " + file_path.string() +
                            " not exist, using default content...");
