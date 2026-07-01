@@ -16,8 +16,7 @@ namespace fs = fs;
 // mapped (harmless) while the fresh code loads. Old copies of the same module
 // are unlinked first (safe on Linux — a still-mapped file persists until exit).
 // Returns the copy path, or the original path on any failure.
-static std::string hot_reload_copy(const std::string &real_so)
-{
+static std::string hot_reload_copy(const std::string &real_so) {
     static std::atomic<unsigned long long> ctr{0};
     try {
         fs::path src(real_so);
@@ -36,8 +35,7 @@ static std::string hot_reload_copy(const std::string &real_so)
         fs::path dst = dir / (stem + "." + std::to_string(ctr++) + ".so");
         fs::copy_file(src, dst, fs::copy_options::overwrite_existing);
         return dst.string();
-    }
-    catch (...) {
+    } catch (...) {
         return real_so;
     }
 }
