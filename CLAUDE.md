@@ -36,6 +36,9 @@ Prefer these verbs over ad-hoc tmux/ps commands:
 | `deploy [main\|simple]` | `build` + `restart` (to ship a new binary) |
 | `qr` / `login` | Render the backend login QR / show it + poll until logged in |
 | `backend-status` / `backend-logs [N]` / `backend-restart` | Inspect / restart the `llbot` backend |
+| `op <words...>` | Inject any operator command as an op (no QQ needed) |
+| `reload [name\|all]` / `swap <name>` | Plugin `reload()` hook / hot-swap a rebuilt `.so` |
+| `enable` / `disable` / `modules` | `bot.on` / `bot.off` / `bot.list_module` |
 
 `build simple` skips rebuilding `libutils`; plain `build`/`main` builds everything.
 
@@ -76,6 +79,22 @@ step stays interactive — Claude drives everything around it (detect → render
 `bot.list_module`, `bot.block|unblock|white|unwhite`, `bot.module.*`.
 Prefer these for plugin reloads — no framework restart needed.
 
+### Driving op commands from the shell (no QQ)
+
+The bot dispatches operator commands from any event on its receive port, gated
+only by `is_op(user_id)`. `shinx-ctl.sh` injects a synthetic message from an op
+(default = first id in `op_list.json`; override `SHINX_OP_QQ`) — same mechanism
+as `tools/dev_tools/sender.sh`. Reply routing by injected `message_type`:
+`private` (default) → the bot DMs the op the reply in QQ; `internal`
+(`SHINX_OP_SILENT=1`) → reply is a no-op at the backend, command still runs.
+
+- `reload <name|all>` = `bot.reload` — calls the plugin's in-place `reload()`
+  hook (config refresh). Does **not** reload the `.so` binary.
+- `swap <name> [function|event]` = `bot.unload` + `bot.load` — dlclose/dlopen,
+  the way to pick up a **freshly rebuilt** plugin `.so` without a full restart.
+- Command results only return via chat (no stdout), so use `private` when you
+  want to see the reply, or check `logs`/`pane` for side effects.
+
 ## On-demand monitoring (this is the "Claude-managed" loop)
 
 When asked to check on the bot:
@@ -85,11 +104,20 @@ When asked to check on the bot:
 3. Report root cause + a recommended fix. Only stop/restart/deploy or edit code
    with explicit approval.
 
-## Known issue
+## CPU cost (was ~315% sustained)
 
-The `bot` child process runs at **~300% CPU sustained** (visible in `status`/`health`).
-Likely a busy-loop in the network/event path — investigate separately; not caused
-by this ops tooling.
+Two causes, root-caused via gdb thread stacks:
+1. **AddressSanitizer leak (FIXED).** `build.sh` only ever *added* `-fsanitize=address`
+   to the CMake cache and never cleared it, so once anyone ran a `sanitize` build,
+   every later build (framework AND all plugins) stayed ASan-instrumented (~2-3x
+   overhead). Fixed in `build.sh`; framework + all 41 plugins rebuilt clean. This
+   removed ~90% CPU. **If you rebuild plugins, wipe their stale `build/` caches too.**
+2. **biliget HTTPS polling (remaining ~220%, plugin-repo issue).** Hot threads sit in
+   `biliget_http::safe_get_json` → `curl_easy_perform` → `OSSL_DECODER_from_bio` —
+   i.e. a fresh TLS handshake per request (no curl handle/connection reuse), plus
+   crypto churn. Fix lives in `shinxbot2-plugins/functions/biliget` (reuse a curl
+   handle / share connections; consider fewer tracked UIDs or a longer
+   `poll_interval_sec`). Not a framework bug.
 
 ## Build deps
 

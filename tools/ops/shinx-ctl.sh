@@ -23,6 +23,13 @@
 #   backend-logs [N]                 Tail the llbot tmux pane (default 40)
 #   backend-restart                  Restart llbot (needed to refresh an expired QR)
 #
+# Operator commands (injected as an op, no QQ needed; SHINX_OP_SILENT=1 = no reply):
+#   op <words...>                    Inject an arbitrary operator command
+#   reload [name|all]                bot.reload — plugins' in-place reload() hook
+#   swap <name> [function|event]     Hot-swap a REBUILT plugin .so (unload+load)
+#   enable | disable                 bot.on / bot.off
+#   modules                          bot.list_module (reply -> op's QQ DM)
+#
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -49,6 +56,59 @@ read_ports() {
         read -r API_PORT EVENT_PORT TOKEN < "$PORT_FILE"
     fi
     : "${API_PORT:=3000}" "${EVENT_PORT:=3001}" "${TOKEN:=}"
+}
+
+# --- operator-command injection -------------------------------------------
+# The bot dispatches operator commands (bot.reload/load/unload/on/off/...) from
+# ANY message event on its receive port, gated only by is_op(user_id). So we can
+# drive them from the shell by POSTing a synthetic message event — no QQ needed
+# (same mechanism as tools/dev_tools/sender.sh). Sender id defaults to the first
+# op in config/core/op_list.json (override with SHINX_OP_QQ).
+#
+# Reply routing by injected message_type:
+#   private  -> the bot DMs the op's QQ the normal reply (admin gets confirmation)
+#   internal -> reply is a no-op at the backend (fully silent); command still runs
+# Default is private; set SHINX_OP_SILENT=1 for internal.
+resolve_op_qq() {
+    [ -n "${OP_QQ:-}" ] && return 0
+    OP_QQ="${SHINX_OP_QQ:-}"
+    [ -n "$OP_QQ" ] && return 0
+    OP_QQ="$(python3 -c "import json;print(json.load(open('$ROOT/config/core/op_list.json'))[0])" 2>/dev/null)"
+    [ -n "$OP_QQ" ]
+}
+
+inject_cmd() { # $1 = command text (e.g. "bot.reload function all")
+    read_ports
+    if ! resolve_op_qq; then bad "no op id (set SHINX_OP_QQ or config/core/op_list.json)"; return 1; fi
+    local mt="private"; [ "${SHINX_OP_SILENT:-0}" = "1" ] && mt="internal"
+    local now; now="$(date +%s)"
+    local payload; payload="$(python3 - "$now" "$mt" "$OP_QQ" "$1" <<'PY'
+import json, sys
+now, mt, uid, text = sys.argv[1:5]
+print(json.dumps({
+    "time": int(now), "self_id": 0, "post_type": "message",
+    "message_type": mt, "sub_type": "friend", "message_id": 0,
+    "user_id": int(uid), "group_id": 0,
+    "message": text, "raw_message": text, "font": 0,
+    "sender": {"nickname": "shinx-ctl", "user_id": int(uid)},
+}))
+PY
+)"
+    # The bot processes the event synchronously before replying, so slow commands
+    # (e.g. bot.backup) can outlast curl's timeout even though they ran. Treat a
+    # timeout (exit 28) as "delivered"; only a real connection error is a failure.
+    local rc=0
+    curl -s -m 10 -X POST -H "Content-Type: application/json" -d "$payload" \
+        "http://127.0.0.1:$EVENT_PORT/" >/dev/null || rc=$?
+    if [ "$rc" -eq 0 ]; then
+        ok "injected as $mt (op=$OP_QQ): $1"
+        [ "$mt" = "private" ] && info "reply (if any) is DM'd to op $OP_QQ in QQ"
+    elif [ "$rc" -eq 28 ]; then
+        ok "delivered as $mt (op=$OP_QQ): $1"
+        info "command is still processing (slow op) — check '$0 logs'/'pane'"
+    else
+        bad "injection failed (curl $rc) — is the bot up on :$EVENT_PORT?"; return 1
+    fi
 }
 
 # --- process/session helpers ----------------------------------------------
@@ -235,6 +295,19 @@ cmd_backend_restart() {
     info "backend (re)start issued; a fresh QR appears in a few seconds — run '$0 login' to scan it"
 }
 
+cmd_reload() { inject_cmd "bot.reload function ${1:-all}"; }   # calls plugins' in-place reload() hook
+
+# Hot-swap a freshly REBUILT plugin .so without restarting the bot: dlclose + dlopen.
+cmd_swap() {
+    [ -z "${1:-}" ] && { bad "usage: $0 swap <function-name> [event]"; return 1; }
+    local kind="${2:-function}"
+    inject_cmd "bot.unload $kind $1" && sleep 1 && inject_cmd "bot.load $kind $1"
+}
+
+cmd_enable()  { inject_cmd "bot.on"; }
+cmd_disable() { inject_cmd "bot.off"; }
+cmd_modules() { inject_cmd "bot.list_module"; }
+
 # --- dispatch --------------------------------------------------------------
 cmd="${1:-}"; shift 2>/dev/null || true
 case "$cmd" in
@@ -252,5 +325,11 @@ case "$cmd" in
     backend-status) cmd_backend_status ;;
     backend-logs)   cmd_backend_logs "${1:-40}" ;;
     backend-restart) cmd_backend_restart ;;
+    op)             if [ $# -gt 0 ]; then inject_cmd "$*"; else bad "usage: $0 op <command...>"; exit 1; fi ;;
+    reload)         cmd_reload "${1:-all}" ;;
+    swap)           cmd_swap "${1:-}" "${2:-function}" ;;
+    enable)         cmd_enable ;;
+    disable)        cmd_disable ;;
+    modules)        cmd_modules ;;
     *) sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac
