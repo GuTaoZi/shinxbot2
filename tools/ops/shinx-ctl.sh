@@ -103,9 +103,11 @@ PY
     if [ "$rc" -eq 0 ]; then
         ok "injected as $mt (op=$OP_QQ): $1"
         [ "$mt" = "private" ] && info "reply (if any) is DM'd to op $OP_QQ in QQ"
+        return 0
     elif [ "$rc" -eq 28 ]; then
         ok "delivered as $mt (op=$OP_QQ): $1"
         info "command is still processing (slow op) — check '$0 logs'/'pane'"
+        return 0
     else
         bad "injection failed (curl $rc) — is the bot up on :$EVENT_PORT?"; return 1
     fi
@@ -297,11 +299,15 @@ cmd_backend_restart() {
 
 cmd_reload() { inject_cmd "bot.reload function ${1:-all}"; }   # calls plugins' in-place reload() hook
 
-# Hot-swap a freshly REBUILT plugin .so without restarting the bot: dlclose + dlopen.
+# Hot-swap a freshly REBUILT plugin .so without restarting the bot: dlclose +
+# dlopen. Preferred over `restart` for plugin updates — a full reboot runs
+# cq_send_all_op("Love you!") and spams every operator. Forced silent (internal
+# message_type) so the unload/load confirmations don't DM ops either.
 cmd_swap() {
     [ -z "${1:-}" ] && { bad "usage: $0 swap <function-name> [event]"; return 1; }
     local kind="${2:-function}"
-    inject_cmd "bot.unload $kind $1" && sleep 1 && inject_cmd "bot.load $kind $1"
+    SHINX_OP_SILENT=1 inject_cmd "bot.unload $kind $1" && sleep 1 && \
+        SHINX_OP_SILENT=1 inject_cmd "bot.load $kind $1"
 }
 
 cmd_enable()  { inject_cmd "bot.on"; }
