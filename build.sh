@@ -17,6 +17,13 @@ if [[ "${2:-}" == "sanitize" || "${SANITIZE:-0}" == "1" ]]; then
     cmake_extra_args+=("-DCMAKE_CXX_FLAGS=${sanitize_flags}")
     cmake_extra_args+=("-DCMAKE_EXE_LINKER_FLAGS=${sanitize_flags}")
     cmake_extra_args+=("-DCMAKE_SHARED_LINKER_FLAGS=${sanitize_flags}")
+else
+    # Explicitly clear these so a prior `sanitize` build's -fsanitize=address does
+    # NOT linger in the CMake cache and silently instrument later Release builds
+    # (ASan adds ~2-3x CPU overhead — a chronic cost if it leaks into production).
+    cmake_extra_args+=("-DCMAKE_CXX_FLAGS=")
+    cmake_extra_args+=("-DCMAKE_EXE_LINKER_FLAGS=")
+    cmake_extra_args+=("-DCMAKE_SHARED_LINKER_FLAGS=")
 fi
 
 cmake -S . -B ./build -DCMAKE_BUILD_TYPE="${build_type}" -DMODE="${1:-}" "${cmake_extra_args[@]}"
