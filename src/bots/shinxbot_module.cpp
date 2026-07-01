@@ -2,10 +2,45 @@
 #include "shinxbot.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <filesystem>
 #include <sstream>
 
 namespace fs = fs;
+
+// Copy a plugin .so to a fresh unique path before dlopen so hot-reload actually
+// picks up rebuilt code. glibc refuses to unload C++ .so files containing
+// STB_GNU_UNIQUE symbols (std::regex/shared_ptr instantiations) or in-use TLS,
+// so dlclose is a no-op and re-dlopen of the SAME path returns the stale code.
+// Loading a NEW path each time sidesteps that entirely: the old copy stays
+// mapped (harmless) while the fresh code loads. Old copies of the same module
+// are unlinked first (safe on Linux — a still-mapped file persists until exit).
+// Returns the copy path, or the original path on any failure.
+static std::string hot_reload_copy(const std::string &real_so)
+{
+    static std::atomic<unsigned long long> ctr{0};
+    try {
+        fs::path src(real_so);
+        if (!fs::exists(src)) {
+            return real_so;
+        }
+        fs::path dir = src.parent_path() / ".hot";
+        fs::create_directories(dir);
+        const std::string stem = src.stem().string();
+        for (const auto &e : fs::directory_iterator(dir)) {
+            if (e.path().filename().string().rfind(stem + ".", 0) == 0) {
+                std::error_code ec;
+                fs::remove(e.path(), ec);
+            }
+        }
+        fs::path dst = dir / (stem + "." + std::to_string(ctr++) + ".so");
+        fs::copy_file(src, dst, fs::copy_options::overwrite_existing);
+        return dst.string();
+    }
+    catch (...) {
+        return real_so;
+    }
+}
 
 template <typename T> void close_dl(void *handle, T *p) {
     typedef void (*close_t)(T *);
@@ -186,8 +221,8 @@ bool shinxbot::handle_bot_load(const std::string &message,
                     }
                     unload_func(functions[i]);
 
-                    auto u = load_function<processable>("./lib/functions/lib" +
-                                                        n + ".so");
+                    auto u = load_function<processable>(
+                        hot_reload_copy("./lib/functions/lib" + n + ".so"));
                     if (u.first != nullptr) {
                         std::get<0>(functions[i]) = u.first;
                         std::get<1>(functions[i]) = u.second;
@@ -207,8 +242,8 @@ bool shinxbot::handle_bot_load(const std::string &message,
             }
 
             if (!found_loaded) {
-                auto u = load_function<processable>("./lib/functions/lib" + n +
-                                                    ".so");
+                auto u = load_function<processable>(
+                    hot_reload_copy("./lib/functions/lib" + n + ".so"));
                 if (u.first != nullptr) {
                     functions.push_back(std::make_tuple(u.first, u.second, n));
                     init_func(n, u.first);
@@ -243,8 +278,8 @@ bool shinxbot::handle_bot_load(const std::string &message,
                     }
                     unload_func(events[i]);
 
-                    auto u = load_function<eventprocess>("./lib/events/lib" +
-                                                         n + ".so");
+                    auto u = load_function<eventprocess>(
+                        hot_reload_copy("./lib/events/lib" + n + ".so"));
                     if (u.first != nullptr) {
                         std::get<0>(events[i]) = u.first;
                         std::get<1>(events[i]) = u.second;
@@ -264,8 +299,8 @@ bool shinxbot::handle_bot_load(const std::string &message,
             }
 
             if (!found_loaded) {
-                auto u =
-                    load_function<eventprocess>("./lib/events/lib" + n + ".so");
+                auto u = load_function<eventprocess>(
+                    hot_reload_copy("./lib/events/lib" + n + ".so"));
                 if (u.first != nullptr) {
                     events.push_back(std::make_tuple(u.first, u.second, n));
                     init_func(n, u.first);
