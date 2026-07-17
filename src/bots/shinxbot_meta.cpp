@@ -1,6 +1,7 @@
 #include "dynamic_lib.hpp"
 #include "shinxbot.hpp"
 
+#include <algorithm>
 #include <filesystem>
 #include <functional>
 #include <iomanip>
@@ -40,6 +41,26 @@ bool shinxbot::meta_func(std::string message, const msg_meta &conf) {
                 continue;
             }
             std::string h = func->help(conf, help_level);
+            // Guardrail: bot.help concatenates every plugin's help() into one
+            // message, so each entry must stay brief (detailed usage belongs
+            // in the plugin's own on-demand *.help command). Flag violations
+            // in the log rather than silently truncating, so a maintainer
+            // notices without user-visible behavior changing.
+            constexpr size_t kHelpEntryWarnChars = 120;
+            constexpr int kHelpEntryWarnLines = 2;
+            const int line_count =
+                (int)std::count(h.begin(), h.end(), '\n') + (h.empty() ? 0 : 1);
+            if (h.size() > kHelpEntryWarnChars ||
+                line_count > kHelpEntryWarnLines) {
+                set_global_log(
+                    LOG::WARNING,
+                    "bot.help: '" + name +
+                        "' help(conf, level) entry looks like a detailed dump ("
+                        + std::to_string(h.size()) + " chars, " +
+                        std::to_string(line_count) +
+                        " lines) -- should be a brief pointer to its own "
+                        "*.help command instead.");
+            }
             if (!trim(h).empty())
                 help_message += h + '\n';
         }
