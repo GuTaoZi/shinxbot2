@@ -1,0 +1,29 @@
+{
+  "_comment": "Per-background placement of the 'x月x日' date text on each sign. Copy to backgrounds.json and edit — or manage it entirely from QQ (bot admin, private chat): dateimg.addbg <name> +image, dateimg.setcfg <name> <field> <value>, dateimg.delbg <name>, dateimg.mode <gif|png>. This file is re-read from disk on every render (no reload command). Coordinates are pixels on the ORIGINAL background PNG; (x,y) is the CENTER of the rendered date text. The final image is downscaled to output_max_px before sending.",
+  "default_font": "",
+  "output_max_px": 1280,
+  "mode": "gif",
+  "backgrounds": {
+    "example_sign.png": {
+      "x": 400,
+      "y": 300,
+      "font_size": 48,
+      "rotation": 0.0,
+      "color": "black",
+      "font": "",
+      "layout": "single"
+    }
+  },
+  "_field_help": {
+    "default_font": "font filename in resource/dateimg/fonts/ used when a background's 'font' is empty; if also empty, the first font found there is used",
+    "mode": "output format: 'gif' = single-frame GIF (QQ shows it as a meme/sticker, transparent bg) or 'png' = normal image. Switch from chat with dateimg.mode <gif|png>.",
+    "lunar": "global on/off (default true): draw the lunar day-of-month above the date in smaller red 大写 numerals (捌/拾捌/廿捌).",
+    "layout": "per-background: 'single' (rectangle signs, one line 'x月x日') or 'double' (square/circle signs, two lines 'x月' / 'x日'). The date is always centered, so it fits any length.",
+    "x": "text center X (px)",
+    "y": "text center Y (px)",
+    "font_size": "point size; larger = bigger text",
+    "rotation": "degrees clockwise to tilt the text so it lies flat on the sign (e.g. -7.0)",
+    "color": "text color, any ImageMagick color name or #RRGGBB (default black)",
+    "font": "font filename in resource/dateimg/fonts/ for THIS background; empty = use default_font"
+  }
+}

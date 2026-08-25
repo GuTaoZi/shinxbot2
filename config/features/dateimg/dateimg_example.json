@@ -1,0 +1,6 @@
+{
+  "_comment": "Runtime subscription state (auto-created/managed by the plugin; you normally don't hand-edit this). Copy to dateimg.json only to preset subscriptions. 'groups' maps group-id -> chosen background filename ('' = pick a random configured background each day).",
+  "groups": {
+    "123456789": ""
+  }
+}

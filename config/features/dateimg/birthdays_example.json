@@ -1,0 +1,13 @@
+{
+  "_comment": "Per-group birthday list. Copy to birthdays.json (gitignored runtime data; usually managed from chat via date.add / date.del in each group). Top-level keys are group ids. A matching birthday is appended as a wish line under that group's daily dateimg push, so the group must have dateimg enabled.",
+  "123456789": [
+    { "who": "祝小白生日快乐！", "lunar": false, "mm": 8, "dd": 10 },
+    { "who": "祝小骑士生日快乐！", "lunar": true, "mm": 1, "dd": 13 }
+  ],
+  "_field_help": {
+    "who": "the full line to send on the birthday",
+    "lunar": "false = fires on Gregorian mm/dd; true = fires when today's LUNAR date == mm/dd (auto-updates every year)",
+    "mm": "month 1-12 (Gregorian, or lunar month)",
+    "dd": "day 1-31 (Gregorian, or lunar day-of-month)"
+  }
+}

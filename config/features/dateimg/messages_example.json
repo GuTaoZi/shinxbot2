@@ -1,0 +1,16 @@
+{
+  "_comment": "Daily blessing line sent together with the date sticker. Copy to messages.json (this file is gitignored as runtime config). Re-read from disk on every send. Manage from QQ (bot admin, private chat): dateimg.msg list | add <句子> | del <序号> | on | off | prefix <文字> | lead <文字>.",
+  "enabled": true,
+  "prefix": "猫好~，今天是",
+  "lead": "",
+  "sentences": [
+    "<一句祝福，例如：今天也是元气满满的一天喵~>",
+    "<可以放很多条，每天每个群随机抽一条>"
+  ],
+  "_field_help": {
+    "enabled": "master on/off for the blessing line",
+    "prefix": "text line shown before the image (set '' to omit)",
+    "lead": "text prepended to the random sentence; default empty because no single lead-in fits every sentence",
+    "sentences": "pool of blessing lines; one is chosen at random per group per day"
+  }
+}
