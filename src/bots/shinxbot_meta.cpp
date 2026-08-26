@@ -10,6 +10,72 @@
 
 namespace fs = fs;
 
+// Send a merged-forward ("chat record") so a long list stays collapsed instead
+// of flooding the chat. Each node = (sender name, content); content is a CQ
+// string, but arbitrary text (with stray [ ]) is sent as one literal text
+// segment rather than throwing. Returns false on any send failure so the caller
+// can fall back to a plain message. (Kept framework-internal: the shared plugin
+// API lives in an upstream submodule we don't push to.)
+static bool
+send_forward_msg(bot *p,
+                 const std::vector<std::pair<std::string, std::string>> &nodes,
+                 const msg_meta &conf) {
+    if (nodes.empty()) {
+        return false;
+    }
+    try {
+        Json::Value messages(Json::arrayValue);
+        const std::string uin = std::to_string(p->get_botqq());
+        for (const auto &kv : nodes) {
+            Json::Value node(Json::objectValue), data(Json::objectValue);
+            node["type"] = "node";
+            data["name"] = kv.first.empty() ? std::string("bot") : kv.first;
+            data["uin"] = uin;
+            Json::Value content;
+            try {
+                content = string_to_messageArr(kv.second);
+            } catch (...) { // not valid CQ -> send as literal text
+                content = Json::Value(Json::arrayValue);
+                Json::Value seg(Json::objectValue);
+                seg["type"] = "text";
+                seg["data"]["text"] = kv.second;
+                content.append(seg);
+            }
+            data["content"] = content;
+            node["data"] = data;
+            messages.append(node);
+        }
+        Json::Value req(Json::objectValue);
+        std::string endpoint;
+        if (conf.message_type == "group") {
+            req["group_id"] = Json::UInt64(conf.group_id);
+            endpoint = "send_group_forward_msg";
+        } else {
+            req["user_id"] = Json::UInt64(conf.user_id);
+            endpoint = "send_private_forward_msg";
+        }
+        req["messages"] = messages;
+        const std::string resp = p->cq_send(endpoint, req);
+        try {
+            const Json::Value r = string_to_json(resp);
+            if (r.isObject() && r.get("status", "ok").asString() == "failed") {
+                set_global_log(LOG::WARNING, "bot.help forward rejected: " + resp);
+                return false;
+            }
+        } catch (...) { // 2xx with unparseable body -> assume it went through
+        }
+        return true;
+    } catch (const std::string &e) {
+        set_global_log(LOG::WARNING, "bot.help forward failed: " + e);
+    } catch (const std::exception &e) {
+        set_global_log(LOG::WARNING,
+                       std::string("bot.help forward failed: ") + e.what());
+    } catch (...) {
+        set_global_log(LOG::WARNING, "bot.help forward failed: unknown");
+    }
+    return false;
+}
+
 bool shinxbot::meta_func(std::string message, const msg_meta &conf) {
     std::string normalized = trim(message);
     const std::string at_me = "[CQ:at,qq=" + std::to_string(get_botqq()) + "]";
@@ -32,20 +98,22 @@ bool shinxbot::meta_func(std::string message, const msg_meta &conf) {
                    is_group_op(conf.p, conf.group_id, conf.user_id)) {
             help_level = help_level_t::group_admin;
         }
-        std::string help_message;
+        std::vector<std::pair<std::string, std::string>> entries;
         for (auto funcx : functions) {
             processable *func = std::get<0>(funcx);
             std::string name = std::get<2>(funcx);
-            if (conf.message_type == "group" &&
-                group_blocklist[conf.group_id].is_blocked(name)) {
-                continue;
+            if (conf.message_type == "group") {
+                auto bl =
+                    group_blocklist.find(conf.group_id); // no insert-on-read
+                if (bl != group_blocklist.end() &&
+                    bl->second.is_blocked(name)) {
+                    continue;
+                }
             }
             std::string h = func->help(conf, help_level);
-            // Guardrail: bot.help concatenates every plugin's help() into one
-            // message, so each entry must stay brief (detailed usage belongs
-            // in the plugin's own on-demand *.help command). Flag violations
-            // in the log rather than silently truncating, so a maintainer
-            // notices without user-visible behavior changing.
+            // Guardrail: each entry should stay brief (detailed usage belongs
+            // in the plugin's own on-demand *.help command). Flag violations in
+            // the log rather than silently truncating.
             constexpr size_t kHelpEntryWarnChars = 120;
             constexpr int kHelpEntryWarnLines = 2;
             const int line_count =
@@ -55,18 +123,34 @@ bool shinxbot::meta_func(std::string message, const msg_meta &conf) {
                 set_global_log(
                     LOG::WARNING,
                     "bot.help: '" + name +
-                        "' help(conf, level) entry looks like a detailed dump ("
-                        + std::to_string(h.size()) + " chars, " +
+                        "' help(conf, level) entry looks like a detailed dump "
+                        "(" +
+                        std::to_string(h.size()) + " chars, " +
                         std::to_string(line_count) +
                         " lines) -- should be a brief pointer to its own "
                         "*.help command instead.");
             }
-            if (!trim(h).empty())
-                help_message += h + '\n';
+            if (!trim(h).empty()) {
+                // each forward node renders as "<sender>\n<content>", so use
+                // "*<name>" as the sender to get the "*name / description"
+                // layout. cq_encode the text so any [ ] & in help can't be
+                // mis-parsed as a CQ code (and it round-trips to display
+                // correctly).
+                entries.emplace_back("*" + name, cq_encode(trim(h)));
+            }
         }
-        help_message += "本Bot项目地址：https://github.com/"
-                        "Jayfeather233/shinxbot2";
-        cq_send(help_message, conf);
+        entries.emplace_back("*项目地址",
+                             "https://github.com/Jayfeather233/shinxbot2");
+        // Fold into a merged-forward ("chat record") so the help list stays
+        // collapsed instead of flooding the chat; fall back to one plain
+        // message if the backend rejects the forward.
+        if (!send_forward_msg(conf.p, entries, conf)) {
+            std::string help_message;
+            for (const auto &e : entries) {
+                help_message += e.second + '\n';
+            }
+            cq_send(help_message, conf);
+        }
         return false;
     };
 
@@ -80,20 +164,17 @@ bool shinxbot::meta_func(std::string message, const msg_meta &conf) {
             return false;
         }
 
-        std::string help_message;
-        help_message += "-----OP core commands-----\n"
-                        "bot.on\n"
-                        "bot.off\n"
-                        "bot.backup\n"
-                        "bot.reload function [name|all]\n"
-                        "bot.load [function|event] name\n"
-                        "bot.unload [function|event] name\n"
-                        "bot.list_alias\n"
-                        "bot.list_module\n"
-                        "-----Feature commands-----";
+        std::vector<std::pair<std::string, std::string>> entries;
+        entries.emplace_back("*OP core commands",
+                             "bot.on\nbot.off\nbot.backup\n"
+                             "bot.reload function [name|all]\n"
+                             "bot.load [function|event] name\n"
+                             "bot.unload [function|event] name\n"
+                             "bot.list_alias\nbot.list_module");
 
         for (auto funcx : functions) {
             processable *func = std::get<0>(funcx);
+            std::string name = std::get<2>(funcx);
             std::string op_help =
                 trim(func->help(conf, help_level_t::bot_admin));
             if (op_help.empty()) {
@@ -106,34 +187,41 @@ bool shinxbot::meta_func(std::string message, const msg_meta &conf) {
                 continue;
             }
 
-            if (!trim(op_help).empty()) {
-                help_message += op_help + '\n';
-            }
+            entries.emplace_back("*" + name, cq_encode(trim(op_help)));
         }
 
-        if (trim(help_message).empty()) {
-            help_message = "No OP-only help available.";
+        if (entries.size() == 1) {
+            cq_send("No OP-only help available.", conf);
+            return false;
         }
-        cq_send(help_message, conf);
+        // fold into a merged-forward; fall back to one message on failure
+        if (!send_forward_msg(conf.p, entries, conf)) {
+            std::string help_message;
+            for (const auto &e : entries) {
+                help_message += e.second + '\n';
+            }
+            cq_send(help_message, conf);
+        }
         return false;
     };
 
     auto handle_bot_off = [&]() {
         bot_enabled = false;
-        cq_send("isopen=" + std::to_string(bot_enabled), conf);
+        cq_send("isopen=" + std::to_string(bot_enabled.load()), conf);
         return false;
     };
 
     auto handle_bot_on = [&]() {
         bot_enabled = true;
-        cq_send("isopen=" + std::to_string(bot_enabled), conf);
+        cq_send("isopen=" + std::to_string(bot_enabled.load()), conf);
         return false;
     };
 
     auto handle_bot_backup = [&]() {
         std::time_t nt = std::chrono::system_clock::to_time_t(
             std::chrono::system_clock::now());
-        tm tt = *localtime(&nt);
+        tm tt{};
+        localtime_r(&nt, &tt);
         std::ostringstream oss;
         oss << "./backup/" << std::put_time(&tt, "%Y-%m-%d_%H-%M-%S") << ".zip";
 
