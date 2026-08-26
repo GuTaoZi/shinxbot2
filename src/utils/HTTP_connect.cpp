@@ -5,6 +5,7 @@
 #include <fmt/ostream.h>
 #include <iostream>
 #include <jsoncpp/json/json.h>
+#include <memory>
 #include <mutex>
 
 enum class http_req_method { GET, POST }; // for now, these are enough
@@ -55,11 +56,16 @@ std::string do_http_request(httplib::Client &client,
                             const std::string &httppath,
                             const std::map<std::string, std::string> &headers,
                             const bool proxy_flg, const http_req_method hrm,
+                            bool path_encode = true,
                             const Json::Value &json_message = Json::Value()) {
 
+    // Clients are cached and reused (see cached_client) for connection/TLS
+    // keep-alive, so every per-request-configurable setting is (re)applied here
+    // to a deterministic value — otherwise state would bleed across calls.
     client.set_connection_timeout(600, 0); // 10 minutes
     client.set_read_timeout(600, 0);       // 10 minutes
     client.set_write_timeout(600, 0);      // 10 minutes
+    client.set_path_encode(path_encode);
     if (proxy_flg) {
         auto get_env = [](const char *k1, const char *k2) -> const char * {
             const char *v = std::getenv(k1);
@@ -128,6 +134,8 @@ std::string do_http_request(httplib::Client &client,
                     "HTTP Request: {} need proxy but no system proxy found.",
                     httpaddr));
         }
+    } else {
+        client.set_proxy("", 0); // clear a proxy left over from a reused client
     }
 
     // Set headers
@@ -141,7 +149,8 @@ std::string do_http_request(httplib::Client &client,
     httplib::Result res =
         hrm == http_req_method::POST
             ? client.Post(httppath, httplib_headers,
-                          Json::FastWriter().write(json_message), "application/json")
+                          Json::FastWriter().write(json_message),
+                          "application/json")
             : client.Get(httppath, httplib_headers);
 
     if (!res || res->status / 100 != 2) {
@@ -164,19 +173,38 @@ std::string do_http_request(httplib::Client &client,
     return res->body;
 }
 
+// Reuse one httplib::Client per (thread, host) so TCP+TLS connections are kept
+// alive across requests instead of a fresh handshake every call (the CLAUDE.md
+// biliget CPU root-cause). thread_local => no cross-thread sharing; the httplib
+// worker/timer/heartbeat threads are long-lived, so the cache is effectively
+// per-connection. Per-request settings are re-applied in do_http_request, so a
+// reused client carries no stale proxy/path-encode state.
+template <typename Factory>
+static httplib::Client &cached_client(const std::string &key, Factory make) {
+    thread_local std::map<std::string, std::unique_ptr<httplib::Client>> cache;
+    std::unique_ptr<httplib::Client> &slot = cache[key];
+    if (!slot) {
+        slot = make();
+        slot->set_keep_alive(true);
+    }
+    return *slot;
+}
+
 std::string do_post(const std::string &httpaddr,
                     const Json::Value &json_message,
                     const std::map<std::string, std::string> &headers,
                     const bool proxy_flg) {
-    auto cli = httplib::Client(httpaddr);
+    auto &cli = cached_client(
+        httpaddr, [&] { return std::make_unique<httplib::Client>(httpaddr); });
     return do_http_request(cli, httpaddr, "", headers, proxy_flg,
-                           http_req_method::POST, json_message);
+                           http_req_method::POST, true, json_message);
 }
 
 std::string do_get(const std::string &httpaddr,
                    const std::map<std::string, std::string> &headers,
                    const bool proxy_flg) {
-    auto cli = httplib::Client(httpaddr);
+    auto &cli = cached_client(
+        httpaddr, [&] { return std::make_unique<httplib::Client>(httpaddr); });
     return do_http_request(cli, httpaddr, "", headers, proxy_flg,
                            http_req_method::GET);
 }
@@ -185,37 +213,40 @@ std::string do_post(const std::string &httpaddr, const std::string &httppath,
                     bool enc, const Json::Value &json_message,
                     const std::map<std::string, std::string> &headers,
                     const bool proxy_flg) {
-    auto cli = httplib::Client(httpaddr);
-    cli.set_path_encode(enc);
+    auto &cli = cached_client(
+        httpaddr, [&] { return std::make_unique<httplib::Client>(httpaddr); });
     return do_http_request(cli, httpaddr, httppath, headers, proxy_flg,
-                           http_req_method::POST, json_message);
+                           http_req_method::POST, enc, json_message);
 }
 
 std::string do_get(const std::string &httpaddr, const std::string &httppath,
                    bool enc, const std::map<std::string, std::string> &headers,
                    const bool proxy_flg) {
-    auto cli = httplib::Client(httpaddr);
-    cli.set_path_encode(enc);
+    auto &cli = cached_client(
+        httpaddr, [&] { return std::make_unique<httplib::Client>(httpaddr); });
     return do_http_request(cli, httpaddr, httppath, headers, proxy_flg,
-                           http_req_method::GET);
+                           http_req_method::GET, enc);
 }
 
 std::string do_post(const std::string &httpaddr, int port,
                     const Json::Value &json_message,
                     const std::map<std::string, std::string> &headers,
                     const bool proxy_flg) {
-    auto cli = httplib::Client(httpaddr, port);
-    return do_http_request(cli, fmt::format("{}:{}", httpaddr, port), "",
-                           headers, proxy_flg, http_req_method::POST,
-                           json_message);
+    const std::string key = fmt::format("{}:{}", httpaddr, port);
+    auto &cli = cached_client(
+        key, [&] { return std::make_unique<httplib::Client>(httpaddr, port); });
+    return do_http_request(cli, key, "", headers, proxy_flg,
+                           http_req_method::POST, true, json_message);
 }
 
 std::string do_get(const std::string &httpaddr, int port,
                    const std::map<std::string, std::string> &headers,
                    const bool proxy_flg) {
-    auto cli = httplib::Client(httpaddr, port);
-    return do_http_request(cli, fmt::format("{}:{}", httpaddr, port), "",
-                           headers, proxy_flg, http_req_method::GET);
+    const std::string key = fmt::format("{}:{}", httpaddr, port);
+    auto &cli = cached_client(
+        key, [&] { return std::make_unique<httplib::Client>(httpaddr, port); });
+    return do_http_request(cli, key, "", headers, proxy_flg,
+                           http_req_method::GET);
 }
 
 std::string do_post(const std::string &httpaddr, int port,
@@ -223,19 +254,20 @@ std::string do_post(const std::string &httpaddr, int port,
                     const Json::Value &json_message,
                     const std::map<std::string, std::string> &headers,
                     const bool proxy_flg) {
-    auto cli = httplib::Client(httpaddr, port);
-    cli.set_path_encode(enc);
-    return do_http_request(cli, fmt::format("{}:{}", httpaddr, port), httppath,
-                           headers, proxy_flg, http_req_method::POST,
-                           json_message);
+    const std::string key = fmt::format("{}:{}", httpaddr, port);
+    auto &cli = cached_client(
+        key, [&] { return std::make_unique<httplib::Client>(httpaddr, port); });
+    return do_http_request(cli, key, httppath, headers, proxy_flg,
+                           http_req_method::POST, enc, json_message);
 }
 
 std::string do_get(const std::string &httpaddr, int port,
                    const std::string &httppath, bool enc,
                    const std::map<std::string, std::string> &headers,
                    const bool proxy_flg) {
-    auto cli = httplib::Client(httpaddr, port);
-    cli.set_path_encode(enc);
-    return do_http_request(cli, fmt::format("{}:{}", httpaddr, port), httppath,
-                           headers, proxy_flg, http_req_method::GET);
+    const std::string key = fmt::format("{}:{}", httpaddr, port);
+    auto &cli = cached_client(
+        key, [&] { return std::make_unique<httplib::Client>(httpaddr, port); });
+    return do_http_request(cli, key, httppath, headers, proxy_flg,
+                           http_req_method::GET, enc);
 }
