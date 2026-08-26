@@ -15,7 +15,7 @@ void Timer::run() {
                 for (auto f : u.second) {
                     try {
                         f(this->p);
-                    } catch (char *e) {
+                    } catch (const char *e) {
                         p->cq_send_all_op(
                             (std::string) "Timer Throw an char*: " + e);
                         p->setlog(LOG::ERROR,

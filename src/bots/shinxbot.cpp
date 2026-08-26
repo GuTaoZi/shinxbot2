@@ -11,7 +11,8 @@ namespace fs = fs;
 void shinxbot::refresh_log_stream() {
     std::time_t nt =
         std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-    tm tt = *std::localtime(&nt);
+    tm tt{};
+    localtime_r(&nt, &tt);
 
     std::string formatted_log =
         fmt::format("./log/{}/{:04}_{:02}_{:02}", botqq, tt.tm_year + 1900,
@@ -49,7 +50,8 @@ void shinxbot::setlog(LOG type, std::string message) {
 
     std::time_t nt =
         std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-    tm tt = *localtime(&nt);
+    tm tt{};
+    localtime_r(&nt, &tt);
 
     if (!(tt.tm_year == last_getlog.tm_year &&
           tt.tm_mon == last_getlog.tm_mon &&

@@ -33,9 +33,7 @@ int main() {
     int x, y;
     std::string token;
     if (iport.is_open()) {
-        while (!iport.eof()) {
-            iport >> x >> y >> token;
-        }
+        iport >> x >> y >> token; // one line: "<send> <recv> <token>"
         iport.close();
     } else {
         std::cout << "Please input the send_port: (receive port in Onebot11):";

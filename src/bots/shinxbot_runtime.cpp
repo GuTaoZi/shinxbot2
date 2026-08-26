@@ -1,6 +1,7 @@
 #include "dynamic_lib.hpp"
 #include "shinxbot.hpp"
 
+#include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <thread>
@@ -65,8 +66,15 @@ void shinxbot::input_process(const std::string &input) {
     if ((post_type == "request" || post_type == "notice") && bot_enabled) {
         for (auto evenx : events) {
             eventprocess *even = std::get<0>(evenx);
-            if (even->check(this, J)) {
-                even->process(this, J);
+            const std::string ename = std::get<2>(evenx);
+            try { // a throwing event must not silently drop the whole tick
+                if (even->check(this, J)) {
+                    even->process(this, J);
+                }
+            } catch (const std::exception &e) {
+                setlog(LOG::ERROR, "event " + ename + " threw: " + e.what());
+            } catch (...) {
+                setlog(LOG::ERROR, "event " + ename + " threw unknown error");
             }
         }
     } else if (post_type == "message") {
@@ -87,13 +95,26 @@ void shinxbot::input_process(const std::string &input) {
                 }
                 msg_meta conf = (msg_meta){message_type, user_id, group_id,
                                            message_id, this};
-                if (meta_func(messageStr, conf) && bot_enabled) {
+                bool run_functions = false;
+                try { // operator commands were previously unguarded
+                    run_functions = meta_func(messageStr, conf);
+                } catch (const std::exception &e) {
+                    setlog(LOG::ERROR,
+                           (std::string) "meta_func threw: " + e.what());
+                } catch (...) {
+                    setlog(LOG::ERROR, "meta_func threw unknown error");
+                }
+                if (run_functions && bot_enabled) {
                     for (auto funcx : functions) {
                         processable *func = std::get<0>(funcx);
                         std::string name = std::get<2>(funcx);
-                        if (message_type == "group" &&
-                            group_blocklist[group_id].is_blocked(name)) {
-                            continue;
+                        if (message_type == "group") {
+                            auto bl =
+                                group_blocklist.find(group_id); // no insert
+                            if (bl != group_blocklist.end() &&
+                                bl->second.is_blocked(name)) {
+                                continue;
+                            }
                         }
                         try {
                             if (func->is_support_messageArr()) {
@@ -214,7 +235,12 @@ void shinxbot::run() {
 
     this->init();
 
-    cq_send_all_op("Love you!");
+    // Greet ops on start, unless suppressed (avoids spamming every op on each
+    // crash-recovery re-fork, and lets a deploy start quietly). Set
+    // SHINX_QUIET_START=1 in the environment to mute.
+    if (std::getenv("SHINX_QUIET_START") == nullptr) {
+        cq_send_all_op("Love you!");
+    }
     heartbeat_thread = std::thread(&heartBeat::run, recorder);
 
     this->mytimer->timer_start();

@@ -4,6 +4,7 @@
 #include "heartbeat.h"
 #include "processable.h"
 
+#include <atomic>
 #include <fstream>
 #include <mutex>
 #include <thread>
@@ -69,7 +70,7 @@ public:
 class shinxbot : public bot {
 private:
     // ===== Runtime flags/state =====
-    bool bot_enabled = true;
+    std::atomic<bool> bot_enabled{true};
 
     // ===== Logging =====
     std::ofstream LOG_output[3];

@@ -53,6 +53,11 @@ void writefile(const fs::path file_path, const std::string &content,
         ofile = openfile(file_path, is_append ? std::ios::app : std::ios::out);
     } catch (...) {
     }
+    if (!ofile.is_open()) { // don't silently drop the write (e.g. config saves)
+        set_global_log(LOG::ERROR,
+                       "writefile: cannot open " + file_path.string());
+        return;
+    }
     ofile << content;
     ofile.flush();
     ofile.close();
