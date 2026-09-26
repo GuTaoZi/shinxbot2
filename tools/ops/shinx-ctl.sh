@@ -22,6 +22,8 @@
 #   backend-status                   NapCat backend session/process check
 #   backend-logs [N]                 Tail the NapCat tmux pane (default 40)
 #   backend-restart                  Restart NapCat (needed to refresh an expired QR)
+#   boot                             Cold start: network -> NapCat -> wait for login -> bot
+#                                    (run at machine boot by tools/ops/shinxbot.service)
 #
 # Operator commands (injected as an op, no QQ needed; SHINX_OP_SILENT=1 = no reply):
 #   op <words...>                    Inject an arbitrary operator command
@@ -298,6 +300,24 @@ cmd_backend_restart() {
     info "backend (re)start issued; a fresh QR appears in a few seconds — run '$0 login' to scan it"
 }
 
+# Unattended cold start, used by the systemd user unit at machine boot. The bot
+# must not start before the backend is logged in: shinxbot::init() takes botqq
+# from get_login_info (-> 0 while logged out, and logs land in log/0/). So this
+# waits on the login indefinitely — if NapCat falls back to a QR, the bot comes
+# up by itself as soon as someone scans it (`login`).
+cmd_boot() {
+    info "boot: waiting for network"
+    for _ in $(seq 1 60); do getent hosts qq.com >/dev/null && break; sleep 2; done
+    if session_exists "$BACKEND_SESSION"; then info "boot: backend session already up"; else cmd_backend_restart; fi
+    local qq="" i=0
+    until qq="$(api_login_qq)"; [ -n "$qq" ]; do
+        [ $((i % 12)) -eq 0 ] && warn "boot: backend not logged in yet — if it wants a QR, run '$0 login'"
+        i=$((i + 1)); sleep 5
+    done
+    ok "boot: backend logged in (qq=$qq)"
+    cmd_start
+}
+
 cmd_reload() { inject_cmd "bot.reload function ${1:-all}"; }   # calls plugins' in-place reload() hook
 
 # Hot-swap a freshly REBUILT plugin .so without restarting the bot: dlclose +
@@ -332,11 +352,12 @@ case "$cmd" in
     backend-status) cmd_backend_status ;;
     backend-logs)   cmd_backend_logs "${1:-40}" ;;
     backend-restart) cmd_backend_restart ;;
+    boot)           cmd_boot ;;
     op)             if [ $# -gt 0 ]; then inject_cmd "$*"; else bad "usage: $0 op <command...>"; exit 1; fi ;;
     reload)         cmd_reload "${1:-all}" ;;
     swap)           cmd_swap "${1:-}" "${2:-function}" ;;
     enable)         cmd_enable ;;
     disable)        cmd_disable ;;
     modules)        cmd_modules ;;
-    *) sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 1 ;;
+    *) sed -n '2,32p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

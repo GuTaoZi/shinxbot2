@@ -2,6 +2,8 @@
 #include "utils.h"
 
 #include <atomic>
+#include <cstdlib>
+#include <ctime>
 #include <sys/wait.h>
 #include <thread>
 #include <vector>
@@ -26,6 +28,10 @@ void bot_run(bot *u) {
 }
 
 int main() {
+    // Lock bot-wide local time to Beijing time (daily resets, date-based
+    // plugins, log rotation) regardless of the host's timezone.
+    setenv("TZ", "Asia/Shanghai", 1);
+    tzset();
     Magick::InitializeMagick("shinxBot");
     signal(SIGPIPE, SIG_IGN);
     signal(SIGALRM, SIG_IGN);

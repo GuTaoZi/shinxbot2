@@ -25,6 +25,17 @@ crashes recover on their own; you do **not** restart on a crash. But a **new bui
 is only picked up after a full stop+start** (the fork-loop keeps the old binary
 alive otherwise) — use `restart`/`deploy` for that.
 
+**Autostart at machine boot:** systemd *user* unit `shinxbot.service`
+(source `tools/ops/shinxbot.service`, installed to `~/.config/systemd/user/`, linger
+enabled) runs `shinx-ctl.sh boot`: waits for network → starts `napcat` → waits for
+the backend login (indefinitely; a QR fallback needs a scan via `login`) → starts
+`bot`. The host gets rebooted by other users now and then, so this is what brings
+the bot back. `systemctl --user status shinxbot` shows the boot progress.
+
+**Timezone:** `main()` forces `TZ=Asia/Shanghai` for the bot process, so every
+`localtime()` user (rua daily limit, dateimg/datemsg, log day dirs) runs on Beijing
+time while the host stays on America/New_York. Don't "fix" the host clock for this.
+
 ## Control script — `tools/ops/shinx-ctl.sh`
 
 Prefer these verbs over ad-hoc tmux/ps commands:
@@ -52,9 +63,9 @@ Backend login requires **scanning a QR with the target QQ's phone**; this cannot
 automated. The workflow's job is to detect the logged-out state, surface the QR in
 the terminal fast, and confirm re-login:
 
-**Every login requires a fresh QR scan** — this setup has no device-trust persistence
-(scanning invalidates the previous session server-side), so a restart never
-auto-relogins. Plan for a human scan on every backend restart.
+**A restart may or may not need a fresh QR scan.** NapCat quick-login (`-q <qq>`)
+has worked across a reboot (2026-09-25) but isn't guaranteed; if it falls back to a
+QR, a human has to scan it. Always check `get_login_info` after a backend restart.
 
 - **Detect:** `get_login_info` returns no `user_id` while the `napcat` session is up
   → logged out. `health` flags this and points at `login`.

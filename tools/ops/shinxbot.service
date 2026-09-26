@@ -1,0 +1,24 @@
+# systemd *user* unit: bring shinxbot2 up at machine boot (tmux sessions
+# `napcat` + `bot`, same as a manual start, so every shinx-ctl.sh verb still works).
+#
+# Install (once):
+#   cp tools/ops/shinxbot.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable shinxbot
+#   sudo loginctl enable-linger $USER   # start the user manager at boot, no login needed
+#
+# KillMode=process: `boot` exits once the bot is launched and the tmux server
+# stays. `systemctl --user stop shinxbot` then only stops the bot (ExecStop);
+# NapCat and any other tmux sessions are left alone.
+[Unit]
+Description=shinxbot2 QQ bot (NapCat backend + bot in tmux)
+
+[Service]
+Type=simple
+RemainAfterExit=yes
+KillMode=process
+WorkingDirectory=%h/shinxbot2
+ExecStart=%h/shinxbot2/tools/ops/shinx-ctl.sh boot
+ExecStop=%h/shinxbot2/tools/ops/shinx-ctl.sh stop
+
+[Install]
+WantedBy=default.target
