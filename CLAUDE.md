@@ -7,8 +7,12 @@ symlinked at `plugins/lib/{functions,events}` → `lib/{functions,events}`.
 
 Two long-lived tmux sessions (already running; don't recreate blindly):
 
-- **`llbot`** — OneBot11 backend (LLBot-CLI under `xvfb-run`), started by
-  `../llbot/start.sh`. Posts events to `127.0.0.1:3001`, serves the API on `3000`.
+- **`napcat`** — OneBot11 backend: NapCat.Shell hooked into LinuxQQ
+  (`/opt/QQ/resources/app/package.json` main → `loadNapCat.js`), run as
+  `xvfb-run -a /opt/QQ/qq --no-sandbox -q 3664637421`. Config lives in
+  `/opt/QQ/resources/app/app_launcher/napcat/config/` (`onebot11_<qq>.json`,
+  `webui.json`). Posts events to `127.0.0.1:3001`, serves the API on `3000`;
+  WebUI on `127.0.0.1:47980` (token in `webui.json`; reach it via SSH tunnel).
 - **`bot`** — `./build/shinxbot`, started from this repo root.
 
 Ports/token come from `config/port.txt` (`<API/send=3000> <event/recv=3001> <token>`).
@@ -35,7 +39,7 @@ Prefer these verbs over ad-hoc tmux/ps commands:
 | `stop` / `start` / `restart` | Lifecycle (stop = SIGINT to fork-loop group) |
 | `deploy [main\|simple]` | `build` + `restart` (to ship a new binary) |
 | `qr` / `login` | Render the backend login QR / show it + poll until logged in |
-| `backend-status` / `backend-logs [N]` / `backend-restart` | Inspect / restart the `llbot` backend |
+| `backend-status` / `backend-logs [N]` / `backend-restart` | Inspect / restart the `napcat` backend |
 | `op <words...>` | Inject any operator command as an op (no QQ needed) |
 | `reload [name\|all]` / `swap <name>` | Plugin `reload()` hook / hot-swap a rebuilt `.so` |
 | `enable` / `disable` / `modules` | `bot.on` / `bot.off` / `bot.list_module` |
@@ -44,7 +48,7 @@ Prefer these verbs over ad-hoc tmux/ps commands:
 
 ## Backend login (QR) — the one manual step
 
-llbot login requires **scanning a QR with the target QQ's phone**; this cannot be
+Backend login requires **scanning a QR with the target QQ's phone**; this cannot be
 automated. The workflow's job is to detect the logged-out state, surface the QR in
 the terminal fast, and confirm re-login:
 
@@ -52,14 +56,14 @@ the terminal fast, and confirm re-login:
 (scanning invalidates the previous session server-side), so a restart never
 auto-relogins. Plan for a human scan on every backend restart.
 
-- **Detect:** `get_login_info` returns no `user_id` while the `llbot` session is up
+- **Detect:** `get_login_info` returns no `user_id` while the `napcat` session is up
   → logged out. `health` flags this and points at `login`.
-- **Show:** `tools/ops/show-qr.py` decodes `~/llbot/qrcode.png` (1-bit grayscale PNG)
+- **Show:** `tools/ops/show-qr.py` decodes `/opt/QQ/resources/app/app_launcher/napcat/cache/qrcode.png`
   with pure-stdlib zlib — no Pillow — and prints it as ANSI half-blocks that a phone
   can scan straight from the terminal. `qr` also warns if the PNG is >5 min old (stale/expired).
-- **Refresh:** if the QR is expired, `backend-restart` bounces llbot so it writes a
-  fresh `qrcode.png`. It relaunches directly (`cd ~/llbot && xvfb-run -a ./llbot`) —
-  **no sudo**; `start.sh` is only for first-time dependency install. llbot also
+- **Refresh:** if the QR is expired, `backend-restart` bounces NapCat so it writes a
+  fresh `qrcode.png`. It relaunches directly (`xvfb-run -a /opt/QQ/qq --no-sandbox -q <qq>`) —
+  **no sudo**. NapCat also
   auto-regenerates an expired QR on its own every ~2–3 min while waiting.
 - **Full flow:** `tools/ops/shinx-ctl.sh login` → shows the QR, then polls
   `get_login_info` every 3 s (up to 180 s) and reports the qq once login lands.

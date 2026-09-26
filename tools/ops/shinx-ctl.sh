@@ -1,7 +1,7 @@
 #!/bin/bash
 # shinx-ctl.sh — Claude-managed lifecycle/ops control for shinxbot2.
 #
-# Wraps the existing tmux setup (sessions `bot` and `llbot`) with deterministic
+# Wraps the existing tmux setup (sessions `bot` and `napcat`) with deterministic
 # verbs so both humans and Claude sessions can build, inspect, and health-check
 # the bot the same way. It does NOT change how the bot runs — the bot binary's
 # own fork-loop (main.cpp bot_run) still auto-restarts the child on a crash.
@@ -19,9 +19,9 @@
 #   health                           Full health check; exit 0 = healthy
 #   qr                               Render the backend login QR to the terminal
 #   login                            Show QR (if logged out) + poll until logged in
-#   backend-status                   llbot backend session/process check
-#   backend-logs [N]                 Tail the llbot tmux pane (default 40)
-#   backend-restart                  Restart llbot (needed to refresh an expired QR)
+#   backend-status                   NapCat backend session/process check
+#   backend-logs [N]                 Tail the NapCat tmux pane (default 40)
+#   backend-restart                  Restart NapCat (needed to refresh an expired QR)
 #
 # Operator commands (injected as an op, no QQ needed; SHINX_OP_SILENT=1 = no reply):
 #   op <words...>                    Inject an arbitrary operator command
@@ -34,12 +34,15 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BOT_SESSION="bot"
-BACKEND_SESSION="llbot"
-BACKEND_DIR="$(cd "$ROOT/.." && pwd)/llbot"
-BACKEND_START="./start.sh"
+# Backend: NapCat.Shell hooked into LinuxQQ (/opt/QQ/resources/app/loadNapCat.js),
+# run headless under Xvfb. Bot account for quick-login comes from SHINX_BOT_QQ.
+BACKEND_SESSION="napcat"
+BACKEND_DIR="/opt/QQ/resources/app/app_launcher/napcat"
+BOT_QQ="${SHINX_BOT_QQ:-3664637421}"
+BACKEND_START="xvfb-run -a /opt/QQ/qq --no-sandbox -q $BOT_QQ"
 BOT_BIN="./build/shinxbot"
 PORT_FILE="$ROOT/config/port.txt"
-QR_FILE="$BACKEND_DIR/qrcode.png"
+QR_FILE="$BACKEND_DIR/cache/qrcode.png"
 QR_RENDER="$ROOT/tools/ops/show-qr.py"
 
 C_R='\033[0;31m'; C_G='\033[0;32m'; C_Y='\033[1;33m'; C_B='\033[0;36m'; C_N='\033[0m'
@@ -184,7 +187,7 @@ cmd_status() {
     else
         echo "  (no shinxbot process)"
     fi
-    echo -n "llbot session: "; session_exists "$BACKEND_SESSION" && echo "up" || echo "MISSING"
+    echo -n "napcat session: "; session_exists "$BACKEND_SESSION" && echo "up" || echo "MISSING"
     local qq; qq="$(api_login_qq)"
     [ -n "$qq" ] && echo "API login qq: $qq (reachable)" || echo "API: unreachable on :$API_PORT"
 }
@@ -203,8 +206,8 @@ cmd_pane()         { tmux capture-pane -pt "$BOT_SESSION" -S "-${1:-40}" 2>/dev/
 cmd_backend_logs() { tmux capture-pane -pt "$BACKEND_SESSION" -S "-${1:-40}" 2>/dev/null || bad "session '$BACKEND_SESSION' not found"; }
 
 cmd_backend_status() {
-    echo -n "llbot session: "; session_exists "$BACKEND_SESSION" && echo "up" || { echo "MISSING"; return 1; }
-    pgrep -af "llbot" | grep -v shinx | sed 's/^/  /' || warn "no llbot process found"
+    echo -n "napcat session: "; session_exists "$BACKEND_SESSION" && echo "up" || { echo "MISSING"; return 1; }
+    pgrep -af "/opt/QQ/qq --no-sandbox" | sed 's/^/  /' || warn "no NapCat/QQ process found"
 }
 
 cmd_health() {
@@ -241,17 +244,17 @@ cmd_health() {
     return "$rc"
 }
 
-# llbot prints "二维码网址: <url>" to its pane at login — grab the newest one.
+# NapCat prints "二维码解码URL: <url>" to its pane at login — grab the newest one.
 qr_url_from_pane() {
     tmux capture-pane -pt "$BACKEND_SESSION" -S -2000 2>/dev/null \
-        | grep -aoE '二维码网址: *https?://[^ ]+' | tail -1 | sed 's/^二维码网址: *//'
+        | grep -aoE '二维码解码URL: *https?://[^ ]+' | tail -1 | sed 's/^二维码解码URL: *//'
 }
 
 cmd_qr() {
     local url; url="$(qr_url_from_pane)"
     [ -n "$url" ] && info "QR payload URL (open on another device if needed):" && echo "    $url"
     if [ ! -f "$QR_FILE" ]; then
-        [ -n "$url" ] && { warn "no $QR_FILE, but llbot also renders its own QR in the pane: $0 backend-logs 40"; return 0; }
+        [ -n "$url" ] && { warn "no $QR_FILE, but NapCat also renders its own QR in the pane: $0 backend-logs 40"; return 0; }
         bad "no QR file at $QR_FILE (backend may already be logged in, or hasn't produced one)"; return 1
     fi
     local age; age=$(( $(date +%s) - $(stat -c %Y "$QR_FILE") ))
@@ -265,7 +268,7 @@ cmd_login() {
     if [ -n "$qq" ]; then ok "already logged in (qq=$qq) — nothing to do"; return 0; fi
     warn "not logged in — bringing up the QR"
     if ! session_exists "$BACKEND_SESSION"; then
-        bad "backend session '$BACKEND_SESSION' is down; start it first (cd $BACKEND_DIR && $BACKEND_START), then re-run '$0 login'"
+        bad "backend session '$BACKEND_SESSION' is down; start it first ($0 backend-restart), then re-run '$0 login'"
         return 1
     fi
     cmd_qr || warn "could not render QR file; check the backend pane: $0 backend-logs"
@@ -280,9 +283,7 @@ cmd_login() {
     return 1
 }
 
-# Direct relaunch (no sudo). start.sh is only needed for first-time dependency
-# install; on an already-provisioned host we launch the llbot CLI directly, which
-# matches the running process (`xvfb-run -a ./llbot`) and avoids start.sh's sudo -v.
+# Direct relaunch (no sudo): QQ with the NapCat hook, under Xvfb.
 cmd_backend_restart() {
     if ! session_exists "$BACKEND_SESSION"; then
         info "creating tmux session '$BACKEND_SESSION'"
@@ -290,10 +291,10 @@ cmd_backend_restart() {
     else
         warn "restarting backend (this drops the current QQ connection; re-login needs a QR scan)"
         tmux send-keys -t "$BACKEND_SESSION" C-c 2>/dev/null
-        for _ in $(seq 1 20); do pgrep -f "bin/pmhq/pmhq" >/dev/null || break; sleep 1; done
-        pgrep -f "$BACKEND_DIR/bin" >/dev/null && { pkill -f "$BACKEND_DIR/bin"; sleep 2; }
+        for _ in $(seq 1 20); do pgrep -f "/opt/QQ/qq" >/dev/null || break; sleep 1; done
+        pgrep -f "/opt/QQ/qq" >/dev/null && { pkill -f "/opt/QQ/qq"; sleep 2; }
     fi
-    tmux send-keys -t "$BACKEND_SESSION" "cd $BACKEND_DIR && xvfb-run -a ./llbot" C-m
+    tmux send-keys -t "$BACKEND_SESSION" "$BACKEND_START" C-m
     info "backend (re)start issued; a fresh QR appears in a few seconds — run '$0 login' to scan it"
 }
 
