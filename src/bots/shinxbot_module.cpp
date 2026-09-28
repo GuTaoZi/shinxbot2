@@ -25,62 +25,136 @@ static std::string hot_reload_copy(const std::string &real_so) {
         }
         fs::path dir = src.parent_path() / ".hot";
         fs::create_directories(dir);
-        const std::string stem = src.stem().string();
+        const std::string prefix = src.stem().string() + ".";
         for (const auto &e : fs::directory_iterator(dir)) {
-            if (e.path().filename().string().rfind(stem + ".", 0) == 0) {
+            if (e.path().filename().string().rfind(prefix, 0) == 0) {
                 std::error_code ec;
                 fs::remove(e.path(), ec);
             }
         }
-        fs::path dst = dir / (stem + "." + std::to_string(ctr++) + ".so");
+        fs::path dst = dir / (prefix + std::to_string(ctr++) + ".so");
         fs::copy_file(src, dst, fs::copy_options::overwrite_existing);
         return dst.string();
-    } catch (...) {
+    } catch (const std::exception &e) {
+        set_global_log(LOG::WARNING, "hot-reload copy of " + real_so +
+                                         " failed, loading in place: " +
+                                         e.what());
         return real_so;
     }
 }
 
-template <typename T> void close_dl(void *handle, T *p) {
-    typedef void (*close_t)(T *);
-    close_t closex = reinterpret_cast<close_t>(dlsym(handle, "destroy_t"));
-    const char *dlsym_error = dlerror();
-    if (dlsym_error) {
-        set_global_log(LOG::WARNING,
-                       std::string("Cannot load symbol 'destroy_t': ") +
-                           dlsym_error);
-        // delete p; // This is not always safe
-    } else {
-        closex(p);
+// Detach the framework hooks a module registered (timer callbacks, backup
+// paths). Must run before the module is destroyed.
+void shinxbot::unload_hooks(const std::string &name) {
+    if (this->mytimer != nullptr) {
+        this->mytimer->remove_callback(name);
     }
-    dlclose(handle);
-}
-
-void shinxbot::unload_func(std::tuple<processable *, void *, std::string> &f) {
-    this->mytimer->remove_callback(std::get<2>(f));
-    this->archive->remove_path(std::get<2>(f));
-
-    close_dl(std::get<1>(f), std::get<0>(f));
-}
-
-void shinxbot::unload_func(std::tuple<eventprocess *, void *, std::string> &f) {
-    this->mytimer->remove_callback(std::get<2>(f));
-    this->archive->remove_path(std::get<2>(f));
-    close_dl(std::get<1>(f), std::get<0>(f));
+    if (this->archive != nullptr) {
+        this->archive->remove_path(name);
+    }
 }
 
 void shinxbot::init_func(const std::string &name, processable *p) {
     p->set_callback([this, name](std::function<void(bot * p)> func) {
-        this->mytimer->add_callback(name, func);
+        this->mytimer->add_callback(name, std::move(func));
     });
     p->set_backup_files(this->archive, name);
 }
 
 void shinxbot::init_func(const std::string &name, eventprocess *p) {}
 
+template <typename T>
+shinxbot::load_result shinxbot::load_or_reload(module_registry<T> &reg,
+                                               const std::string &dir,
+                                               const std::string &name) {
+    std::lock_guard<std::mutex> admin(module_admin_mutex_);
+    // Take the old instance out first so no new dispatch pass picks it up.
+    auto old = reg.take(name);
+    const bool was_loaded = old.first != nullptr;
+    const bool restart_timer =
+        was_loaded && this->mytimer != nullptr && this->mytimer->is_running();
+    if (restart_timer) {
+        this->mytimer->timer_stop();
+    }
+    if (was_loaded) {
+        unload_hooks(name);
+        old.first->close_on_release = true;
+        old.first.reset(); // closes now, or when the last dispatch pass ends
+    }
+
+    auto u = load_function<T>(hot_reload_copy(dir + "lib" + name + ".so"));
+    if (u.first != nullptr) {
+        reg.insert(old.second, u.first, u.second, name); // same slot as before
+        init_func(name, u.first);
+    }
+    if (restart_timer) {
+        this->mytimer->timer_start();
+    }
+    if (u.first == nullptr) {
+        return load_result::failed;
+    }
+    return was_loaded ? load_result::reloaded : load_result::loaded;
+}
+
+template <typename T>
+bool shinxbot::unload_module(module_registry<T> &reg, const std::string &name) {
+    std::lock_guard<std::mutex> admin(module_admin_mutex_);
+    auto old = reg.take(name);
+    if (old.first == nullptr) {
+        return false;
+    }
+    const bool restart_timer =
+        this->mytimer != nullptr && this->mytimer->is_running();
+    if (restart_timer) {
+        this->mytimer->timer_stop();
+    }
+    unload_hooks(name);
+    old.first->close_on_release = true;
+    old.first.reset(); // closes now, or when the last dispatch pass ends
+    if (restart_timer) {
+        this->mytimer->timer_start();
+    }
+    return true;
+}
+
+template shinxbot::load_result
+shinxbot::load_or_reload<processable>(module_registry<processable> &,
+                                      const std::string &, const std::string &);
+template shinxbot::load_result
+shinxbot::load_or_reload<eventprocess>(module_registry<eventprocess> &,
+                                       const std::string &,
+                                       const std::string &);
+template bool
+shinxbot::unload_module<processable>(module_registry<processable> &,
+                                     const std::string &);
+template bool
+shinxbot::unload_module<eventprocess>(module_registry<eventprocess> &,
+                                      const std::string &);
+
+void shinxbot::unload_all_modules() {
+    functions.close_all();
+    events.close_all();
+}
+
 void shinxbot::load_module_filter_config() {
+    std::lock_guard<std::mutex> lock(module_filter_mutex_);
     const std::string cfg_path = bot_config_path(this, "core/module_load.json");
     const bool cfg_exists = fs::exists(cfg_path);
     Json::Value J = string_to_json(readfile(cfg_path, "{}"));
+    if (!J.isObject()) {
+        if (cfg_exists) {
+            // Unparseable/non-object file: keep a copy before it gets
+            // regenerated below, so a hand-edit typo can't silently wipe the
+            // operator's module selection.
+            std::error_code ec;
+            fs::copy_file(cfg_path, cfg_path + ".corrupt",
+                          fs::copy_options::overwrite_existing, ec);
+            set_global_log(LOG::ERROR, "module_load.json is not a JSON object; "
+                                       "saved a copy to " +
+                                           cfg_path + ".corrupt");
+        }
+        J = Json::Value(Json::objectValue);
+    }
 
     enabled_functions.clear();
     enabled_events.clear();
@@ -126,6 +200,7 @@ void shinxbot::save_module_filter_config() const {
 }
 
 void shinxbot::add_module_to_filter(const std::string &name, bool is_event) {
+    std::lock_guard<std::mutex> lock(module_filter_mutex_);
     if (is_event) {
         enabled_events.insert(name);
     } else {
@@ -136,6 +211,7 @@ void shinxbot::add_module_to_filter(const std::string &name, bool is_event) {
 
 void shinxbot::remove_module_from_filter(const std::string &name,
                                          bool is_event) {
+    std::lock_guard<std::mutex> lock(module_filter_mutex_);
     if (is_event) {
         enabled_events.erase(name);
     } else {
@@ -145,31 +221,32 @@ void shinxbot::remove_module_from_filter(const std::string &name,
 }
 
 std::vector<std::string>
-shinxbot::list_available_module_names(bool is_event) const {
+shinxbot::list_available_module_names(bool is_event) {
     std::vector<std::string> names;
     const fs::path dir =
         is_event ? fs::path("./lib/events/") : fs::path("./lib/functions/");
-    if (!fs::exists(dir)) {
-        return names;
-    }
-
-    for (const auto &entry : fs::directory_iterator(dir)) {
-        if (!(entry.is_regular_file() || entry.is_symlink())) {
+    std::error_code ec;
+    for (fs::directory_iterator it(dir, ec), end; !ec && it != end;
+         it.increment(ec)) {
+        const auto &entry = *it;
+        std::error_code tec;
+        if (!(entry.is_regular_file(tec) || entry.is_symlink(tec))) {
             continue;
         }
 
-        std::string filename = entry.path().filename().string();
-        if (filename.size() <= 3 ||
-            filename.substr(filename.size() - 3) != ".so") {
+        std::string name = entry.path().filename().string();
+        if (name.size() <= 3 || name.compare(name.size() - 3, 3, ".so") != 0) {
             continue;
         }
-
-        std::string name = filename;
-        if (name.find("lib") == 0) {
-            name = name.substr(3);
+        if (name.rfind("lib", 0) == 0) {
+            name.erase(0, 3);
         }
         name.erase(name.length() - 3);
-        names.push_back(name);
+        names.push_back(std::move(name));
+    }
+    if (ec && ec != std::errc::no_such_file_or_directory) {
+        set_global_log(LOG::WARNING, "listing " + dir.string() +
+                                         " failed: " + ec.message());
     }
 
     std::sort(names.begin(), names.end());
@@ -177,285 +254,139 @@ shinxbot::list_available_module_names(bool is_event) const {
     return names;
 }
 
-bool shinxbot::handle_bot_load(const std::string &message,
-                               const msg_meta &conf) {
-    std::istringstream iss(message.substr(8));
-    std::ostringstream oss;
-    std::string type, name;
+namespace {
+// "bot.load function a b" -> returns "function", names={a,b}; `skip` is the
+// command prefix length (the dispatcher guarantees the prefix matched).
+std::string parse_type_and_names(const std::string &message, size_t skip,
+                                 std::vector<std::string> &names) {
+    std::istringstream iss(message.substr(std::min(skip, message.size())));
+    std::string type;
     iss >> type;
-
-    std::vector<std::string> names;
+    std::string name;
     while (iss >> name) {
         names.push_back(name);
     }
+    return type;
+}
+} // namespace
 
-    if (names.empty()) {
+bool shinxbot::handle_bot_load(const std::string &message,
+                               const msg_meta &conf) {
+    std::vector<std::string> names;
+    const std::string type = parse_type_and_names(message, 8, names);
+
+    if (names.empty() || (type != "function" && type != "event")) {
         cq_send("useage: bot.load [function|event] name", conf);
         return false;
     }
+    const bool is_event = type == "event";
 
-    auto contains_name = [](const std::vector<std::string> &arr,
-                            const std::string &target) {
-        return std::find(arr.begin(), arr.end(), target) != arr.end();
-    };
-
-    if (type == "function") {
-        const auto available = list_available_module_names(false);
-        for (const auto &n : names) {
-            if (!contains_name(available, n)) {
-                oss << "load " << n
-                    << " failed: module not found (use bot.list_alias)"
-                    << std::endl;
-                continue;
-            }
-
-            bool found_loaded = false;
-            for (size_t i = 0; i < functions.size(); ++i) {
-                if (std::get<2>(functions[i]) == n) {
-                    const bool restart_timer = (this->mytimer != nullptr &&
-                                                this->mytimer->is_running());
-                    if (restart_timer) {
-                        this->mytimer->timer_stop();
-                    }
-                    unload_func(functions[i]);
-
-                    auto u = load_function<processable>(
-                        hot_reload_copy("./lib/functions/lib" + n + ".so"));
-                    if (u.first != nullptr) {
-                        std::get<0>(functions[i]) = u.first;
-                        std::get<1>(functions[i]) = u.second;
-                        init_func(n, u.first);
-                        add_module_to_filter(n, false);
-                        oss << "reload " << n << std::endl;
-                    } else {
-                        functions.erase(functions.begin() + i);
-                        oss << "load " << n << " failed" << std::endl;
-                    }
-                    if (restart_timer) {
-                        this->mytimer->timer_start();
-                    }
-                    found_loaded = true;
-                    break;
-                }
-            }
-
-            if (!found_loaded) {
-                auto u = load_function<processable>(
-                    hot_reload_copy("./lib/functions/lib" + n + ".so"));
-                if (u.first != nullptr) {
-                    functions.push_back(std::make_tuple(u.first, u.second, n));
-                    init_func(n, u.first);
-                    add_module_to_filter(n, false);
-                    oss << "load " << n << std::endl;
-                } else {
-                    oss << "load " << n << " failed" << std::endl;
-                }
-            }
+    std::ostringstream oss;
+    const auto available = list_available_module_names(is_event);
+    for (const auto &n : names) {
+        if (std::find(available.begin(), available.end(), n) ==
+            available.end()) {
+            oss << "load " << n
+                << " failed: module not found (use bot.list_alias)" << '\n';
+            continue;
         }
-        cq_send(trim(oss.str()), conf);
-        return false;
-    }
-
-    if (type == "event") {
-        const auto available = list_available_module_names(true);
-        for (const auto &n : names) {
-            if (!contains_name(available, n)) {
-                oss << "load " << n
-                    << " failed: module not found (use bot.list_alias)"
-                    << std::endl;
-                continue;
-            }
-
-            bool found_loaded = false;
-            for (size_t i = 0; i < events.size(); ++i) {
-                if (std::get<2>(events[i]) == n) {
-                    const bool restart_timer = (this->mytimer != nullptr &&
-                                                this->mytimer->is_running());
-                    if (restart_timer) {
-                        this->mytimer->timer_stop();
-                    }
-                    unload_func(events[i]);
-
-                    auto u = load_function<eventprocess>(
-                        hot_reload_copy("./lib/events/lib" + n + ".so"));
-                    if (u.first != nullptr) {
-                        std::get<0>(events[i]) = u.first;
-                        std::get<1>(events[i]) = u.second;
-                        init_func(n, u.first);
-                        add_module_to_filter(n, true);
-                        oss << "reload " << n << std::endl;
-                    } else {
-                        events.erase(events.begin() + i);
-                        oss << "load " << n << " failed" << std::endl;
-                    }
-                    if (restart_timer) {
-                        this->mytimer->timer_start();
-                    }
-                    found_loaded = true;
-                    break;
-                }
-            }
-
-            if (!found_loaded) {
-                auto u = load_function<eventprocess>(
-                    hot_reload_copy("./lib/events/lib" + n + ".so"));
-                if (u.first != nullptr) {
-                    events.push_back(std::make_tuple(u.first, u.second, n));
-                    init_func(n, u.first);
-                    add_module_to_filter(n, true);
-                    oss << "load " << n << std::endl;
-                } else {
-                    oss << "load " << n << " failed" << std::endl;
-                }
-            }
+        const load_result r =
+            is_event ? load_or_reload(events, "./lib/events/", n)
+                     : load_or_reload(functions, "./lib/functions/", n);
+        if (r == load_result::failed) {
+            oss << "load " << n << " failed" << '\n';
+            continue;
         }
-        cq_send(trim(oss.str()), conf);
-        return false;
+        add_module_to_filter(n, is_event);
+        oss << (r == load_result::reloaded ? "reload " : "load ") << n
+            << '\n';
     }
-
-    cq_send("useage: bot.load [function|event] name", conf);
+    cq_send(trim(oss.str()), conf);
     return false;
 }
 
 bool shinxbot::handle_bot_unload(const std::string &message,
                                  const msg_meta &conf) {
-    std::istringstream iss(message.substr(10));
-    std::ostringstream oss;
-    std::string type, name;
-    iss >> type;
-
     std::vector<std::string> names;
-    while (iss >> name) {
-        names.push_back(name);
-    }
+    const std::string type = parse_type_and_names(message, 10, names);
 
-    if (names.empty()) {
+    if (names.empty() || (type != "function" && type != "event")) {
         cq_send("useage: bot.unload [function|event] name", conf);
         return false;
     }
+    const bool is_event = type == "event";
 
-    if (type == "function") {
-        for (const auto &n : names) {
-            bool flg = true;
-            for (size_t i = 0; i < functions.size(); ++i) {
-                if (std::get<2>(functions[i]) == n) {
-                    const bool restart_timer = (this->mytimer != nullptr &&
-                                                this->mytimer->is_running());
-                    if (restart_timer) {
-                        this->mytimer->timer_stop();
-                    }
-                    unload_func(functions[i]);
-                    functions.erase(functions.begin() + i);
-                    if (restart_timer) {
-                        this->mytimer->timer_start();
-                    }
-                    oss << "unload " << n << std::endl;
-                    flg = false;
-                    break;
-                }
-            }
-            remove_module_from_filter(n, false);
-            if (flg) {
-                oss << n << " not found (removed from module_load if existed)"
-                    << std::endl;
-            }
+    std::ostringstream oss;
+    for (const auto &n : names) {
+        const bool found = is_event ? unload_module(events, n)
+                                    : unload_module(functions, n);
+        if (found) {
+            oss << "unload " << n << '\n';
         }
-        cq_send(trim(oss.str()), conf);
-        return false;
-    }
-
-    if (type == "event") {
-        for (const auto &n : names) {
-            bool flg = true;
-            for (size_t i = 0; i < events.size(); ++i) {
-                if (std::get<2>(events[i]) == n) {
-                    const bool restart_timer = (this->mytimer != nullptr &&
-                                                this->mytimer->is_running());
-                    if (restart_timer) {
-                        this->mytimer->timer_stop();
-                    }
-                    unload_func(events[i]);
-                    events.erase(events.begin() + i);
-                    if (restart_timer) {
-                        this->mytimer->timer_start();
-                    }
-                    oss << "unload " << n << std::endl;
-                    flg = false;
-                    break;
-                }
-            }
-            remove_module_from_filter(n, true);
-            if (flg) {
-                oss << n << " not found (removed from module_load if existed)"
-                    << std::endl;
-            }
+        remove_module_from_filter(n, is_event);
+        if (!found) {
+            oss << n << " not found (removed from module_load if existed)"
+                << '\n';
         }
-        cq_send(trim(oss.str()), conf);
-        return false;
     }
-
-    cq_send("useage: bot.unload [function|event] name", conf);
+    cq_send(trim(oss.str()), conf);
     return false;
 }
 
 bool shinxbot::handle_bot_reload(const std::string &message,
                                  const msg_meta &conf) {
-    std::istringstream iss(message.substr(10));
-    std::ostringstream oss;
-    std::string type;
-    iss >> type;
-
     std::vector<std::string> names;
-    std::string name;
-    while (iss >> name) {
-        names.push_back(name);
-    }
+    const std::string type = parse_type_and_names(message, 10, names);
 
     if (type != "function") {
         cq_send("useage: bot.reload function [name|all]", conf);
         return false;
     }
 
-    if (functions.empty()) {
+    // One snapshot for the whole command: the modules stay loaded throughout.
+    const auto snap = functions.snapshot();
+    if (snap->empty()) {
         cq_send("No loaded functions.", conf);
         return false;
     }
 
+    std::ostringstream oss;
     auto reload_one = [&](processable *func, const std::string &alias) {
         bool ok = false;
         try {
             ok = func->reload(conf);
+        } catch (const std::exception &e) {
+            set_global_log(LOG::ERROR,
+                           "reload " + alias + " threw: " + e.what());
         } catch (...) {
-            ok = false;
+            set_global_log(LOG::ERROR,
+                           "reload " + alias + " threw unknown error");
         }
 
         if (ok) {
-            oss << "reload " << alias << " ok" << std::endl;
+            oss << "reload " << alias << " ok" << '\n';
         } else {
             oss << "reload " << alias << " skipped (stateless or unsupported)"
-                << std::endl;
+                << '\n';
         }
     };
 
     if (names.empty() || (names.size() == 1 && names[0] == "all")) {
-        for (const auto &u : functions) {
-            reload_one(std::get<0>(u), std::get<2>(u));
+        for (const auto &u : *snap) {
+            reload_one(std::get<0>(u), u.name());
         }
         cq_send(trim(oss.str()), conf);
         return false;
     }
 
     for (const auto &target : names) {
-        bool found = false;
-        for (const auto &u : functions) {
-            if (std::get<2>(u) == target) {
-                reload_one(std::get<0>(u), target);
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
-            oss << "reload " << target << " failed: not loaded" << std::endl;
+        auto it =
+            std::find_if(snap->begin(), snap->end(),
+                         [&](const auto &u) { return u.name() == target; });
+        if (it != snap->end()) {
+            reload_one(std::get<0>(*it), target);
+        } else {
+            oss << "reload " << target << " failed: not loaded" << '\n';
         }
     }
 

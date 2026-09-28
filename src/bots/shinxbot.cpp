@@ -1,6 +1,5 @@
 #include "shinxbot.hpp"
 
-#include <dlfcn.h>
 #include <filesystem>
 #include <fmt/core.h>
 #include <iostream>
@@ -9,17 +8,27 @@ namespace fs = fs;
 
 // ===== Logging =====
 void shinxbot::refresh_log_stream() {
+    // Also called from init() while plugin threads may already be logging.
+    std::lock_guard<std::mutex> lock(log_lock);
+    refresh_log_stream_unlocked();
+}
+
+void shinxbot::refresh_log_stream_unlocked() {
     std::time_t nt =
         std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
     tm tt{};
     localtime_r(&nt, &tt);
+    last_getlog = tt;
 
     std::string formatted_log =
         fmt::format("./log/{}/{:04}_{:02}_{:02}", botqq, tt.tm_year + 1900,
                     tt.tm_mon + 1, tt.tm_mday);
 
-    if (!fs::exists(formatted_log.c_str())) {
-        fs::create_directories(formatted_log.c_str());
+    std::error_code ec;
+    fs::create_directories(formatted_log, ec);
+    if (ec) {
+        fmt::print(stderr, "cannot create log dir {}: {}\n", formatted_log,
+                   ec.message());
     }
     for (int i = 0; i < 3; i++) {
         if (LOG_output[i].is_open()) {
@@ -46,6 +55,10 @@ bool shinxbot::is_op(const userid_t a) const {
 
 // ===== Runtime logging and teardown =====
 void shinxbot::setlog(LOG type, std::string message) {
+    // Plugins may pass any int cast to LOG; don't index past the 3 streams.
+    if (type < LOG::INFO || type > LOG::ERROR) {
+        type = LOG::ERROR;
+    }
     std::lock_guard<std::mutex> lock(log_lock);
 
     std::time_t nt =
@@ -56,8 +69,7 @@ void shinxbot::setlog(LOG type, std::string message) {
     if (!(tt.tm_year == last_getlog.tm_year &&
           tt.tm_mon == last_getlog.tm_mon &&
           tt.tm_mday == last_getlog.tm_mday)) {
-        last_getlog = tt;
-        this->refresh_log_stream();
+        this->refresh_log_stream_unlocked();
     }
 
     std::string formatted_message =
@@ -83,6 +95,10 @@ void shinxbot::cq_send_all_op(const std::string &message) {
 shinxbot::~shinxbot() {
     if (this->mytimer != nullptr) {
         this->mytimer->timer_stop();
+    }
+    // Close plugins (via their destroy_t) while timer/archive still exist.
+    unload_all_modules();
+    if (this->mytimer != nullptr) {
         delete this->mytimer;
         this->mytimer = nullptr;
     }
@@ -98,15 +114,4 @@ shinxbot::~shinxbot() {
         delete this->recorder;
         this->recorder = nullptr;
     }
-
-    for (auto ux : functions) {
-        delete std::get<0>(ux);
-        dlclose(std::get<1>(ux));
-    }
-    functions.clear();
-    for (auto ux : events) {
-        delete std::get<0>(ux);
-        dlclose(std::get<1>(ux));
-    }
-    events.clear();
 }

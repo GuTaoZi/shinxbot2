@@ -17,7 +17,7 @@ namespace fs = fs;
 // can fall back to a plain message. (Kept framework-internal: the shared plugin
 // API lives in an upstream submodule we don't push to.)
 static bool
-send_forward_msg(bot *p,
+send_forward_msg(const bot *p,
                  const std::vector<std::pair<std::string, std::string>> &nodes,
                  const msg_meta &conf) {
     if (nodes.empty()) {
@@ -63,6 +63,7 @@ send_forward_msg(bot *p,
                 return false;
             }
         } catch (...) { // 2xx with unparseable body -> assume it went through
+            return true;
         }
         return true;
     } catch (const std::string &e) {
@@ -76,13 +77,19 @@ send_forward_msg(bot *p,
     return false;
 }
 
-bool shinxbot::meta_func(std::string message, const msg_meta &conf) {
+bool shinxbot::meta_func(const std::string &message, const msg_meta &conf) {
     std::string normalized = trim(message);
     const std::string at_me = "[CQ:at,qq=" + std::to_string(get_botqq()) + "]";
 
     const bool is_start_with_at_me = normalized.rfind(at_me, 0) == 0;
     if (is_start_with_at_me) {
         normalized = trim(normalized.substr(normalized.find(']') + 1));
+    }
+
+    // Every operator command below starts with "bot.": skip building the
+    // handler table (~20 std::function objects) for ordinary chat messages.
+    if (normalized.rfind("bot.", 0) != 0) {
+        return true;
     }
 
     auto can_manage_group = [&]() {
@@ -99,18 +106,14 @@ bool shinxbot::meta_func(std::string message, const msg_meta &conf) {
             help_level = help_level_t::group_admin;
         }
         std::vector<std::pair<std::string, std::string>> entries;
-        for (auto funcx : functions) {
+        const bool is_group = conf.message_type == "group";
+        for (const auto &funcx : functions) {
             processable *func = std::get<0>(funcx);
-            std::string name = std::get<2>(funcx);
-            if (conf.message_type == "group") {
-                auto bl =
-                    group_blocklist.find(conf.group_id); // no insert-on-read
-                if (bl != group_blocklist.end() &&
-                    bl->second.is_blocked(name)) {
-                    continue;
-                }
+            const std::string &name = std::get<2>(funcx);
+            if (is_group && is_blocked_in_group(conf.group_id, name)) {
+                continue;
             }
-            std::string h = func->help(conf, help_level);
+            const std::string h = func->help(conf, help_level);
             // Guardrail: each entry should stay brief (detailed usage belongs
             // in the plugin's own on-demand *.help command). Flag violations in
             // the log rather than silently truncating.
@@ -130,13 +133,14 @@ bool shinxbot::meta_func(std::string message, const msg_meta &conf) {
                         " lines) -- should be a brief pointer to its own "
                         "*.help command instead.");
             }
-            if (!trim(h).empty()) {
+            const std::string brief = trim(h);
+            if (!brief.empty()) {
                 // each forward node renders as "<sender>\n<content>", so use
                 // "*<name>" as the sender to get the "*name / description"
                 // layout. cq_encode the text so any [ ] & in help can't be
                 // mis-parsed as a CQ code (and it round-trips to display
                 // correctly).
-                entries.emplace_back("*" + name, cq_encode(trim(h)));
+                entries.emplace_back("*" + name, cq_encode(brief));
             }
         }
         entries.emplace_back("*项目地址",
@@ -172,9 +176,9 @@ bool shinxbot::meta_func(std::string message, const msg_meta &conf) {
                              "bot.unload [function|event] name\n"
                              "bot.list_alias\nbot.list_module");
 
-        for (auto funcx : functions) {
+        for (const auto &funcx : functions) {
             processable *func = std::get<0>(funcx);
-            std::string name = std::get<2>(funcx);
+            const std::string &name = std::get<2>(funcx);
             std::string op_help =
                 trim(func->help(conf, help_level_t::bot_admin));
             if (op_help.empty()) {
@@ -187,7 +191,7 @@ bool shinxbot::meta_func(std::string message, const msg_meta &conf) {
                 continue;
             }
 
-            entries.emplace_back("*" + name, cq_encode(trim(op_help)));
+            entries.emplace_back("*" + name, cq_encode(op_help));
         }
 
         if (entries.size() == 1) {
@@ -243,12 +247,12 @@ bool shinxbot::meta_func(std::string message, const msg_meta &conf) {
     auto handle_bot_list_module = [&]() {
         std::ostringstream oss;
         oss << "functions:\n";
-        for (auto u : functions) {
-            oss << "  " << std::get<2>(u) << std::endl;
+        for (const auto &u : functions) {
+            oss << "  " << std::get<2>(u) << '\n';
         }
         oss << "events:\n";
-        for (auto u : events) {
-            oss << "  " << std::get<2>(u) << std::endl;
+        for (const auto &u : events) {
+            oss << "  " << std::get<2>(u) << '\n';
         }
         cq_send(oss.str(), conf);
         return false;
@@ -319,9 +323,12 @@ bool shinxbot::meta_func(std::string message, const msg_meta &conf) {
 
     auto handle_group_blockclear = [&]() {
         if (can_manage_group()) {
-            group_blocklist[conf.group_id].clear();
+            {
+                std::unique_lock<std::shared_mutex> lock(blocklist_mutex_);
+                group_blocklist[conf.group_id].clear();
+                save_blocklist();
+            }
             cq_send("已清除屏蔽功能", conf);
-            save_blocklist();
             return false;
         } else {
             return true;
@@ -331,12 +338,16 @@ bool shinxbot::meta_func(std::string message, const msg_meta &conf) {
     auto handle_group_block = [&]() {
         if (can_manage_group()) {
             std::istringstream iss(normalized.substr(9));
-            std::string type;
-            while (iss >> type) {
-                group_blocklist[conf.group_id].add_block(type);
+            {
+                std::unique_lock<std::shared_mutex> lock(blocklist_mutex_);
+                blockItem &item = group_blocklist[conf.group_id];
+                std::string type;
+                while (iss >> type) {
+                    item.add_block(type);
+                }
+                save_blocklist();
             }
             cq_send("已添加屏蔽功能", conf);
-            save_blocklist();
             return false;
         } else {
             return true;
@@ -346,12 +357,16 @@ bool shinxbot::meta_func(std::string message, const msg_meta &conf) {
     auto handle_group_unblock = [&]() {
         if (can_manage_group()) {
             std::istringstream iss(normalized.substr(11));
-            std::string type;
-            while (iss >> type) {
-                group_blocklist[conf.group_id].remove_block(type);
+            {
+                std::unique_lock<std::shared_mutex> lock(blocklist_mutex_);
+                blockItem &item = group_blocklist[conf.group_id];
+                std::string type;
+                while (iss >> type) {
+                    item.remove_block(type);
+                }
+                save_blocklist();
             }
             cq_send("已移除屏蔽功能", conf);
-            save_blocklist();
             return false;
         } else {
             return true;
@@ -361,12 +376,16 @@ bool shinxbot::meta_func(std::string message, const msg_meta &conf) {
     auto handle_group_white = [&]() {
         if (can_manage_group()) {
             std::istringstream iss(normalized.substr(9));
-            std::string type;
-            while (iss >> type) {
-                group_blocklist[conf.group_id].add_white(type);
+            {
+                std::unique_lock<std::shared_mutex> lock(blocklist_mutex_);
+                blockItem &item = group_blocklist[conf.group_id];
+                std::string type;
+                while (iss >> type) {
+                    item.add_white(type);
+                }
+                save_blocklist();
             }
             cq_send("已添加白名单功能", conf);
-            save_blocklist();
             return false;
         } else {
             return true;
@@ -376,12 +395,16 @@ bool shinxbot::meta_func(std::string message, const msg_meta &conf) {
     auto handle_group_unwhite = [&]() {
         if (can_manage_group()) {
             std::istringstream iss(normalized.substr(11));
-            std::string type;
-            while (iss >> type) {
-                group_blocklist[conf.group_id].remove_white(type);
+            {
+                std::unique_lock<std::shared_mutex> lock(blocklist_mutex_);
+                blockItem &item = group_blocklist[conf.group_id];
+                std::string type;
+                while (iss >> type) {
+                    item.remove_white(type);
+                }
+                save_blocklist();
             }
             cq_send("已移除白名单功能", conf);
-            save_blocklist();
             return false;
         } else {
             return true;
@@ -526,82 +549,46 @@ bool shinxbot::meta_func(std::string message, const msg_meta &conf) {
                 return false;
             }
             // load module
-            if (type == "functions") {
-                add_module_to_filter(name, false);
-                std::string dest_path = "./lib/functions/lib" + name + ".so";
-                bool already_loaded = false;
-                if (fs::exists(dest_path)) {
-                    already_loaded = true;
-                    for (size_t i = 0; i < functions.size(); ++i) {
-                        if (std::get<2>(functions[i]) == name) {
-                            unload_func(functions[i]);
-                            functions.erase(functions.begin() + i);
-                            fs::remove(dest_path);
-                            break;
-                        }
-                    }
-                }
-                fs::copy_file(output_path, dest_path);
-                auto u = load_function<processable>(dest_path);
-                if (u.first != nullptr) {
-                    functions.push_back(
-                        std::make_tuple(u.first, u.second, name));
-                    init_func(name, u.first);
-                    if (already_loaded) {
-                        cq_send(fmt::format("{}/{}/{}: 编译并重新加载成功",
-                                            plugin_path, type, name),
-                                conf);
-                    } else {
-                        cq_send(fmt::format("{}/{}/{}: 编译并加载成功",
-                                            plugin_path, type, name),
-                                conf);
-                    }
-                } else {
-                    cq_send(fmt::format("{}/{}/{}: 编译成功，但加载失败",
-                                        plugin_path, type, name),
-                            conf);
-                    return false;
-                }
-            } else if (type == "events") {
-                add_module_to_filter(name, true);
-                std::string dest_path = "./lib/events/lib" + name + ".so";
-                bool already_loaded = false;
-                if (fs::exists(dest_path)) {
-                    already_loaded = true;
-                    for (size_t i = 0; i < events.size(); ++i) {
-                        if (std::get<2>(events[i]) == name) {
-                            unload_func(events[i]);
-                            events.erase(events.begin() + i);
-                            fs::remove(dest_path);
-                            break;
-                        }
-                    }
-                }
-                fs::copy_file(output_path, dest_path);
-                auto u = load_function<eventprocess>(dest_path);
-                if (u.first != nullptr) {
-                    events.push_back(std::make_tuple(u.first, u.second, name));
-                    init_func(name, u.first);
-                    if (already_loaded) {
-                        cq_send(fmt::format("{}/{}/{}: 编译并重新加载成功",
-                                            plugin_path, type, name),
-                                conf);
-                    } else {
-                        cq_send(fmt::format("{}/{}/{}: 编译并加载成功",
-                                            plugin_path, type, name),
-                                conf);
-                    }
-                } else {
-                    cq_send(fmt::format("{}/{}/{}: 编译成功，但加载失败",
-                                        plugin_path, type, name),
-                            conf);
-                    return false;
-                }
-            } else {
+            const bool is_event = type == "events";
+            if (!is_event && type != "functions") {
                 cq_send("命令格式错误，正确格式：bot.module.compile_and_load "
                         "[alias] [functions/events/all] [name]",
                         conf);
                 return false;
+            }
+            add_module_to_filter(name, is_event);
+            const std::string lib_dir =
+                is_event ? "./lib/events/" : "./lib/functions/";
+            const std::string dest_path = lib_dir + "lib" + name + ".so";
+            const bool already_loaded = fs::exists(dest_path);
+            // remove + copy (a new inode), never overwrite in place: a module
+            // loaded at startup maps this very file.
+            std::error_code ec;
+            fs::remove(dest_path, ec);
+            fs::copy_file(output_path, dest_path, ec);
+            if (ec) {
+                set_global_log(LOG::ERROR, "compile_and_load: copy to " +
+                                               dest_path +
+                                               " failed: " + ec.message());
+            }
+            const load_result r =
+                ec ? load_result::failed
+                   : (is_event ? load_or_reload(events, lib_dir, name)
+                               : load_or_reload(functions, lib_dir, name));
+            if (r == load_result::failed) {
+                cq_send(fmt::format("{}/{}/{}: 编译成功，但加载失败",
+                                    plugin_path, type, name),
+                        conf);
+                return false;
+            }
+            if (already_loaded) {
+                cq_send(fmt::format("{}/{}/{}: 编译并重新加载成功",
+                                    plugin_path, type, name),
+                        conf);
+            } else {
+                cq_send(fmt::format("{}/{}/{}: 编译并加载成功", plugin_path,
+                                    type, name),
+                        conf);
             }
             return true;
         };
@@ -618,11 +605,10 @@ bool shinxbot::meta_func(std::string message, const msg_meta &conf) {
                 for (const auto &entry :
                      fs::directory_iterator(function_path)) {
                     if (entry.is_directory()) {
-                        std::string name = entry.path().filename().string();
-                        if (!compile_and_load("functions", name)) {
-                            cq_send(
-                                fmt::format("function {} 编译加载失败", name),
-                                conf);
+                        const std::string sub = entry.path().filename().string();
+                        if (!compile_and_load("functions", sub)) {
+                            cq_send(fmt::format("function {} 编译加载失败", sub),
+                                    conf);
                         }
                     }
                 }
@@ -630,9 +616,9 @@ bool shinxbot::meta_func(std::string message, const msg_meta &conf) {
             if (fs::exists(event_path)) {
                 for (const auto &entry : fs::directory_iterator(event_path)) {
                     if (entry.is_directory()) {
-                        std::string name = entry.path().filename().string();
-                        if (!compile_and_load("events", name)) {
-                            cq_send(fmt::format("event {} 编译加载失败", name),
+                        const std::string sub = entry.path().filename().string();
+                        if (!compile_and_load("events", sub)) {
+                            cq_send(fmt::format("event {} 编译加载失败", sub),
                                     conf);
                         }
                     }
@@ -665,7 +651,6 @@ bool shinxbot::meta_func(std::string message, const msg_meta &conf) {
 
     const std::string cmdline = normalized;
     const auto require_op = [&]() { return is_op(conf.user_id); };
-    const auto require_group = [&]() { return conf.message_type == "group"; };
     const auto require_group_at_bot = [&]() {
         return conf.message_type == "group" && is_start_with_at_me;
     };
@@ -716,6 +701,13 @@ bool shinxbot::meta_func(std::string message, const msg_meta &conf) {
     }
 
     return true;
+}
+
+bool shinxbot::is_blocked_in_group(groupid_t gid,
+                                   const std::string &name) const {
+    std::shared_lock<std::shared_mutex> lock(blocklist_mutex_);
+    auto bl = group_blocklist.find(gid); // no insert-on-read
+    return bl != group_blocklist.end() && bl->second.is_blocked(name);
 }
 
 void shinxbot::save_blocklist() {
