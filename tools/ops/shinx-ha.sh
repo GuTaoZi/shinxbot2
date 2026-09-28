@@ -138,7 +138,11 @@ cmd_takeover() {
     esac
     hlog "takeover (peer was $ps)"
     if [ "${1:-}" = "--no-wait" ]; then
-        setsid nohup "$CTL" boot >> "$LOG" 2>&1 < /dev/null &
+        # 9>&- : don't hand the HA lock to the background boot (and the QQ it
+        # starts). Otherwise, while it waits for a login that never comes,
+        # every later tick finds the lock taken and exits — including the one
+        # that should hand the bot back once the peer is online again.
+        setsid nohup "$CTL" boot >> "$LOG" 2>&1 < /dev/null 9>&- &
         info "boot launched in background (log: $LOG)"
     else
         "$CTL" boot
@@ -175,7 +179,10 @@ peer_build() {
         ! grep -l 'error:' /tmp/shx-build.log /tmp/shx-plug-f.log /tmp/shx-plug-e.log" \
         || { bad "build failed on $PEER — see /tmp/shx-build.log, /tmp/shx-plug-*.log there"; return 1; }
     ok "build ok on $PEER"
-    if [ "$(peer_state)" != standby ]; then info "peer is active — restarting its bot"; peer "$PEER_ROOT/tools/ops/shinx-ctl.sh restart"; fi
+    # Only a peer that is actually serving (logged in) gets its bot restarted;
+    # one merely "active" (e.g. a takeover still waiting for its login) must
+    # not have a bot started behind it.
+    if [ "$(peer_state)" = online ]; then info "peer is serving — restarting its bot"; peer "$PEER_ROOT/tools/ops/shinx-ctl.sh restart"; fi
 }
 
 cmd_code_push() {
