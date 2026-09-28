@@ -51,6 +51,43 @@ static std::string summarize_body_for_log(const std::string &body) {
     return flat;
 }
 
+namespace {
+
+// Proxy environment, read once: getenv() isn't thread-safe against setenv(),
+// and nothing changes these after startup (main() only sets TZ, pre-threads).
+struct ProxyEnv {
+    std::string http, https;
+    bool has_http = false, has_https = false;
+    const char *http_or_null() const {
+        return has_http ? http.c_str() : nullptr;
+    }
+    const char *https_or_null() const {
+        return has_https ? https.c_str() : nullptr;
+    }
+};
+
+const ProxyEnv &proxy_env_vars() {
+    static const ProxyEnv env = [] {
+        ProxyEnv e;
+        auto get_env = [](const char *k1, const char *k2) -> const char * {
+            const char *v = std::getenv(k1); // NOLINT(concurrency-mt-unsafe)
+            return v ? v : std::getenv(k2);  // NOLINT(concurrency-mt-unsafe)
+        };
+        if (const char *v = get_env("http_proxy", "HTTP_PROXY")) {
+            e.http = v;
+            e.has_http = true;
+        }
+        if (const char *v = get_env("https_proxy", "HTTPS_PROXY")) {
+            e.https = v;
+            e.has_https = true;
+        }
+        return e;
+    }();
+    return env;
+}
+
+} // namespace
+
 std::string do_http_request(httplib::Client &client,
                             const std::string &httpaddr,
                             const std::string &httppath,
@@ -62,21 +99,19 @@ std::string do_http_request(httplib::Client &client,
     // Clients are cached and reused (see cached_client) for connection/TLS
     // keep-alive, so every per-request-configurable setting is (re)applied here
     // to a deterministic value — otherwise state would bleed across calls.
-    client.set_connection_timeout(600, 0); // 10 minutes
-    client.set_read_timeout(600, 0);       // 10 minutes
-    client.set_write_timeout(600, 0);      // 10 minutes
+    // A TCP connect that hasn't completed in 30s is dead (blackholed host /
+    // bad route); don't pin a worker thread for 10 minutes on it. Reads and
+    // writes keep the long timeout: some backends (uploads, LLM APIs) are slow.
+    client.set_connection_timeout(30, 0);
+    client.set_read_timeout(600, 0);  // 10 minutes
+    client.set_write_timeout(600, 0); // 10 minutes
     client.set_path_encode(path_encode);
     if (proxy_flg) {
-        auto get_env = [](const char *k1, const char *k2) -> const char * {
-            const char *v = std::getenv(k1);
-            return v ? v : std::getenv(k2);
-        };
-
         const bool is_https = httpaddr.rfind("https://", 0) == 0;
-        const char *proxy_env = is_https ? get_env("https_proxy", "HTTPS_PROXY")
-                                         : get_env("http_proxy", "HTTP_PROXY");
+        const char *proxy_env = is_https ? proxy_env_vars().https_or_null()
+                                         : proxy_env_vars().http_or_null();
         if (!proxy_env) {
-            proxy_env = get_env("http_proxy", "HTTP_PROXY");
+            proxy_env = proxy_env_vars().http_or_null();
         }
 
         if (proxy_env) {
