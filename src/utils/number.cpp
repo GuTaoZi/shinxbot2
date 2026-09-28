@@ -16,70 +16,55 @@ std::string to_human_string(const int64_t u) {
     return ss.str();
 }
 
-int64_t my_string2int64(const std::wstring &s) {
-    int64_t ans = 0;
-    int64_t f = 1;
-    bool is_digit = false;
-    for (size_t i = 0; i < s.length(); i++) {
-        if (s[i] == L'-') {
-            f = -1;
-            is_digit = true;
-        } else if (L'0' <= s[i] && s[i] <= L'9') {
-            ans = ans * 10 + s[i] - L'0';
-            is_digit = true;
-        } else if (is_digit) {
+namespace {
+
+// Shared parser for the four my_string2* overloads. Accumulates in uint64_t
+// so an over-long digit run wraps (as the old code did in practice) instead
+// of being signed-overflow UB.
+template <typename Str>
+uint64_t parse_leading_number(const Str &s, bool &negative) {
+    using Ch = typename Str::value_type;
+    uint64_t ans = 0;
+    bool seen_digit = false;
+    negative = false;
+    for (const Ch &c : s) {
+        if (c == Ch('-')) {
+            negative = true;
+            seen_digit = true;
+        } else if (Ch('0') <= c && c <= Ch('9')) {
+            ans = ans * 10 + static_cast<uint64_t>(c - Ch('0'));
+            seen_digit = true;
+        } else if (seen_digit) {
             break;
         }
     }
-    return ans * f;
+    return ans;
+}
+
+int64_t to_signed(uint64_t magnitude, bool negative) {
+    return static_cast<int64_t>(negative ? 0 - magnitude : magnitude);
+}
+
+} // namespace
+
+int64_t my_string2int64(const std::wstring &s) {
+    bool negative = false;
+    const uint64_t ans = parse_leading_number(s, negative);
+    return to_signed(ans, negative);
 }
 
 uint64_t my_string2uint64(const std::wstring &s) {
-    uint64_t ans = 0;
-    bool is_digit = false;
-    for (size_t i = 0; i < s.length(); i++) {
-        if (s[i] == L'-') {
-            is_digit = true;
-        } else if (L'0' <= s[i] && s[i] <= L'9') {
-            ans = ans * 10 + s[i] - L'0';
-            is_digit = true;
-        } else if (is_digit) {
-            break;
-        }
-    }
-    return ans;
+    bool negative = false;
+    return parse_leading_number(s, negative);
 }
 
 int64_t my_string2int64(const std::string &s) {
-    int64_t ans = 0;
-    int64_t f = 1;
-    bool is_digit = false;
-    for (size_t i = 0; i < s.length(); i++) {
-        if (s[i] == '-') {
-            f = -1;
-            is_digit = true;
-        } else if ('0' <= s[i] && s[i] <= '9') {
-            ans = ans * 10 + s[i] - '0';
-            is_digit = true;
-        } else if (is_digit) {
-            break;
-        }
-    }
-    return ans * f;
+    bool negative = false;
+    const uint64_t ans = parse_leading_number(s, negative);
+    return to_signed(ans, negative);
 }
 
 uint64_t my_string2uint64(const std::string &s) {
-    uint64_t ans = 0;
-    bool is_digit = false;
-    for (size_t i = 0; i < s.length(); i++) {
-        if (s[i] == '-') {
-            is_digit = true;
-        } else if ('0' <= s[i] && s[i] <= '9') {
-            ans = ans * 10 + s[i] - '0';
-            is_digit = true;
-        } else if (is_digit) {
-            break;
-        }
-    }
-    return ans;
+    bool negative = false;
+    return parse_leading_number(s, negative);
 }

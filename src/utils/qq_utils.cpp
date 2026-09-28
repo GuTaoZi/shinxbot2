@@ -1,5 +1,6 @@
 #include "utils.h"
 
+#include <algorithm>
 #include <filesystem>
 #include <iostream>
 #include <jsoncpp/json/json.h>
@@ -143,12 +144,9 @@ bool is_group_member(const bot *p, const groupid_t &group_id,
     J["group_id"] = group_id;
     J = string_to_json(p->cq_send("get_group_member_list", J));
     J = J["data"];
-    for (auto j : J) {
-        if (j["user_id"].asUInt64() == user_id) {
-            return true;
-        }
-    }
-    return false;
+    return std::any_of(J.begin(), J.end(), [&](const Json::Value &j) {
+        return j["user_id"].asUInt64() == user_id;
+    });
 }
 
 bool is_friend(const bot *p, const userid_t &user_id) {
@@ -178,7 +176,7 @@ void send_file_private(const bot *p, const userid_t user_id,
 std::string substitute_image_segment(bot *p, std::string segment, const fs::path &save_dir, const std::string &cq_image_segment_template) {
     size_t cq_pos = segment.find("[CQ:image");
     while (cq_pos != std::string::npos) {
-        size_t end_pos = segment.find("]", cq_pos);
+        size_t end_pos = segment.find(']', cq_pos);
         if (end_pos == std::string::npos) {
             break; // Invalid segment, no closing bracket
         }
@@ -196,8 +194,16 @@ std::string substitute_image_segment(bot *p, std::string segment, const fs::path
             }
         }
         if (params.count("file") > 0 && params.count("url") > 0) {
-            std::string file_name = params["file"];
-            std::string url = params["url"];
+            // The name comes from the message; keep only its last component
+            // so a crafted "../x" can't write outside save_dir.
+            std::string file_name =
+                fs::path(params["file"]).filename().string();
+            const std::string &url = params["url"];
+            if (file_name.empty() || file_name == "." || file_name == "..") {
+                p->setlog(LOG::WARNING, "Invalid CQ:image segment, bad file name.");
+                cq_pos = segment.find("[CQ:image", cq_pos + 1);
+                continue;
+            }
             try {
                 download(url, save_dir, file_name);
                 fs::path local_path = fs::absolute(save_dir / file_name);
@@ -205,6 +211,8 @@ std::string substitute_image_segment(bot *p, std::string segment, const fs::path
                 segment.replace(cq_pos, end_pos - cq_pos + 1, cq_image_segment);
             } catch (const std::exception &e) {
                 p->setlog(LOG::ERROR, "Failed to download image: " + std::string(e.what()));
+            } catch (const std::string &e) { // download() rethrows do_get's
+                p->setlog(LOG::ERROR, "Failed to download image: " + e);
             }
         } else {
             p->setlog(LOG::WARNING, "Invalid CQ:image segment, missing file or url parameter.");

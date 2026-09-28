@@ -1,17 +1,82 @@
 #include "image_utils.h"
 #include "utils.h"
 
-void addRandomNoiseSingle(Magick::Image &img, int strength = 4) {
-    size_t width = img.columns();
-    size_t height = img.rows();
-    if (width * height > 4000000) {
-        double resize_d = sqrt((double)width * height / 4000000.0);
-        img.resize(Magick::Geometry((size_t)(width / resize_d),
-                                    (size_t)(height / resize_d)));
-        width = img.columns();
-        height = img.rows();
-    }
+namespace {
 
+using MagickCore::Quantum; // QuantumRange/QuantumScale macros name it
+
+// True if we may edit img's R/G/B quantums directly (a Pixels view) with the
+// same result as Image::pixelColor get/set: plain sRGB with all three
+// channels present and updatable. Anything else (gray, CMYK, ...) goes
+// through pixelColor, which handles the colorspace mapping.
+bool rgb_view_ok(const Magick::Image &img) {
+    const MagickCore::Image *im = img.constImage();
+    if (im->colorspace != MagickCore::sRGBColorspace) {
+        return false;
+    }
+    for (auto ch : {MagickCore::RedPixelChannel, MagickCore::GreenPixelChannel,
+                    MagickCore::BluePixelChannel}) {
+        if ((MagickCore::GetPixelChannelTraits(im, ch) &
+             MagickCore::UpdatePixelTrait) == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// rgb_view_ok plus an alpha channel: then pixelColor(x, y, Color(0,0,0,0))
+// is exactly "R = G = B = A = 0".
+bool rgba_view_ok(const Magick::Image &img) {
+    return rgb_view_ok(img) &&
+           (MagickCore::GetPixelChannelTraits(img.constImage(),
+                                              MagickCore::AlphaPixelChannel) &
+            MagickCore::UpdatePixelTrait) != 0;
+}
+
+// Make every pixel in [x0,x1) x [y0,y1) for which keep(x, y) is false fully
+// transparent black — the same as pixelColor(x, y, Color(0, 0, 0, 0)) per
+// pixel, but through one pixel view instead of a cache round trip each.
+template <typename Keep>
+void clear_pixels(Magick::Image &img, size_t x0, size_t x1, size_t y0,
+                  size_t y1, Keep keep) {
+    if (x0 >= x1 || y0 >= y1) {
+        return;
+    }
+    // out-of-image coordinates: keep pixelColor's own bounds handling
+    if (!rgba_view_ok(img) || x1 > img.columns() || y1 > img.rows()) {
+        for (size_t y = y0; y < y1; ++y) {
+            for (size_t x = x0; x < x1; ++x) {
+                if (!keep(x, y)) {
+                    img.pixelColor(x, y, Magick::Color(0, 0, 0, 0));
+                }
+            }
+        }
+        return;
+    }
+    img.classType(Magick::DirectClass); // as pixelColor's setter does
+    img.modifyImage();
+    Magick::Pixels view(img);
+    for (size_t y = y0; y < y1; ++y) {
+        Magick::Quantum *q = view.get(x0, y, x1 - x0, 1);
+        // Read the layout only after get(): leaving PseudoClass drops the
+        // index channel lazily, on the first pixel access.
+        const MagickCore::Image *im = img.constImage();
+        const ssize_t r = MagickCore::GetPixelChannelOffset(im, MagickCore::RedPixelChannel);
+        const ssize_t g = MagickCore::GetPixelChannelOffset(im, MagickCore::GreenPixelChannel);
+        const ssize_t b = MagickCore::GetPixelChannelOffset(im, MagickCore::BluePixelChannel);
+        const ssize_t a = MagickCore::GetPixelChannelOffset(im, MagickCore::AlphaPixelChannel);
+        const size_t nch = MagickCore::GetPixelChannels(im);
+        for (size_t x = x0; x < x1; ++x, q += nch) {
+            if (!keep(x, y)) {
+                q[r] = q[g] = q[b] = q[a] = 0;
+            }
+        }
+        view.sync();
+    }
+}
+
+void add_noise_via_pixel_color(Magick::Image &img, size_t width, size_t height,
+                               int strength) {
     // Loop through each pixel and add a random value
     for (size_t y = 0; y < height; ++y) {
         for (size_t x = 0; x < width; ++x) {
@@ -30,6 +95,56 @@ void addRandomNoiseSingle(Magick::Image &img, int strength = 4) {
 
             img.pixelColor(x, y, pixel);
         }
+    }
+}
+
+} // namespace
+
+void addRandomNoiseSingle(Magick::Image &img, int strength = 4) {
+    size_t width = img.columns();
+    size_t height = img.rows();
+    if (width * height > 4000000) {
+        double resize_d = sqrt((double)width * height / 4000000.0);
+        img.resize(Magick::Geometry((size_t)(width / resize_d),
+                                    (size_t)(height / resize_d)));
+        width = img.columns();
+        height = img.rows();
+    }
+
+    if (!rgb_view_ok(img)) {
+        add_noise_via_pixel_color(img, width, height, strength);
+        return;
+    }
+
+    // Same arithmetic and the same get_random() call order as
+    // add_noise_via_pixel_color, on the raw quantums of one pixel view
+    // (pixelColor costs a pixel-cache round trip per pixel, x2).
+    img.classType(Magick::DirectClass); // as pixelColor's setter does
+    img.modifyImage();
+    const int var = strength << 1;
+    auto shift = [](Magick::Quantum &q, double delta) {
+        const double v = QuantumScale * q + delta;
+        q = MagickCore::ClampToQuantum(std::max(std::min(v, 1.0), 0.0) *
+                                       QuantumRange);
+    };
+    Magick::Pixels view(img);
+    for (size_t y = 0; y < height; ++y) {
+        Magick::Quantum *q = view.get(0, y, width, 1);
+        // Layout only after get() — see clear_pixels.
+        const MagickCore::Image *im = img.constImage();
+        const ssize_t ro = MagickCore::GetPixelChannelOffset(im, MagickCore::RedPixelChannel);
+        const ssize_t go = MagickCore::GetPixelChannelOffset(im, MagickCore::GreenPixelChannel);
+        const ssize_t bo = MagickCore::GetPixelChannelOffset(im, MagickCore::BluePixelChannel);
+        const size_t nch = MagickCore::GetPixelChannels(im);
+        for (size_t x = 0; x < width; ++x, q += nch) {
+            double randomValuer = (get_random(var) - (var >> 1)) / 255.0;
+            double randomValueg = (get_random(var) - (var >> 1)) / 255.0;
+            double randomValueb = (get_random(var) - (var >> 1)) / 255.0;
+            shift(q[ro], randomValuer);
+            shift(q[go], randomValueg);
+            shift(q[bo], randomValueb);
+        }
+        view.sync();
     }
 }
 
@@ -54,7 +169,7 @@ void addRandomNoise(const std::string &filePath) {
             addRandomNoiseSingle(img);
             img.write(filePath);
         }
-    } catch (std::exception &e) {
+    } catch (const std::exception &e) {
         set_global_log(LOG::ERROR, e.what());
     }
 }
@@ -102,12 +217,10 @@ void mirrorImage(Magick::Image &img, char axis, bool direction,
     // Mirror operation
     if (axis == 0) { // Vertical axis (flip)
         // Delete original half side first
-        for (size_t y = (direction == 0 ? img.rows() >> 1 : 0);
-             y < (direction == 0 ? img.rows() : img.rows() >> 1); ++y) {
-            for (size_t x = 0; x < img.columns(); ++x) {
-                img.pixelColor(x, y, Magick::Color(0, 0, 0, 0));
-            }
-        }
+        clear_pixels(img, 0, img.columns(),
+                     direction == 0 ? img.rows() >> 1 : 0,
+                     direction == 0 ? img.rows() : img.rows() >> 1,
+                     [](size_t, size_t) { return false; });
         new_img.flip();
         if (direction == 0) {
             copyImageTo(img, new_img, new_img.rows() >> 1, new_img.rows(), 0,
@@ -120,13 +233,9 @@ void mirrorImage(Magick::Image &img, char axis, bool direction,
         }
     } else if (axis == 1) { // Horizontal axis (flop)
         // Delete original half side first
-        for (size_t y = 0; y < img.rows(); ++y) {
-            for (size_t x = (direction == 0 ? img.columns() >> 1 : 0);
-                 x < (direction == 0 ? img.columns() : img.columns() >> 1);
-                 ++x) {
-                img.pixelColor(x, y, Magick::Color(0, 0, 0, 0));
-            }
-        }
+        clear_pixels(img, direction == 0 ? img.columns() >> 1 : 0,
+                     direction == 0 ? img.columns() : img.columns() >> 1, 0,
+                     img.rows(), [](size_t, size_t) { return false; });
         new_img.flop();
         if (direction == 0) {
             copyImageTo(img, new_img, 0, new_img.rows(), new_img.columns() >> 1,
@@ -191,15 +300,11 @@ void crop_to_circle(Magick::Image &img) {
     double cx = radius, cy = radius;
     double radius_sq = radius * radius;
 
-    for (size_t y = 0; y < len; ++y) {
-        for (size_t x = 0; x < len; ++x) {
-            double dx = x + 0.5 - cx;
-            double dy = y + 0.5 - cy;
-            if (dx * dx + dy * dy > radius_sq) {
-                img.pixelColor(x, y, Magick::Color(0, 0, 0, 0));
-            }
-        }
-    }
+    clear_pixels(img, 0, len, 0, len, [&](size_t x, size_t y) {
+        double dx = x + 0.5 - cx;
+        double dy = y + 0.5 - cy;
+        return dx * dx + dy * dy <= radius_sq;
+    });
 }
 
 void constsize_rotate(Magick::Image &img, double deg) {
@@ -218,9 +323,22 @@ void constsize_rotate(Magick::Image &img, double deg) {
     // img.write("test_cir_"+std::to_string(deg)+".png");
 }
 
+namespace {
+// fps is a divisor below; 0 used to raise SIGFPE and kill the whole bot.
+void check_rotate_fps(int fps, const char *func) {
+    if (fps > 0) {
+        return;
+    }
+    set_global_log(LOG::ERROR, fmt::format("Invalid parameter in {}, fps= {}",
+                                           func, fps));
+    throw "Invalid parameter, see more in log.";
+}
+} // namespace
+
 std::vector<Magick::Image> rotateImage(const Magick::Image img, int fps,
                                        bool clockwise,
                                        std::function<void(float)> callback) {
+    check_rotate_fps(fps, __FUNCTION__);
     Magick::Image dimg = img;
     dimg.alphaChannel(MagickCore::AlphaChannelOption::SetAlphaChannel);
 
@@ -254,8 +372,12 @@ std::vector<Magick::Image> rotateImage(const Magick::Image img, int fps,
 
 void rotateImage(std::vector<Magick::Image> &img, int fps, bool clockwise,
                  std::function<void(float)> callback) {
+    check_rotate_fps(fps, __FUNCTION__);
     std::vector<Magick::Image> coalesced;
     Magick::coalesceImages(&coalesced, img.begin(), img.end());
+    if (coalesced.empty()) {
+        return; // nothing to rotate (coalesced[index] below needs a frame)
+    }
     int total_delay = 0;
     for (auto &im : coalesced) {
         im.alphaChannel(MagickCore::AlphaChannelOption::SetAlphaChannel);
@@ -308,9 +430,15 @@ void rotateImage(std::vector<Magick::Image> &img, int fps, bool clockwise,
     std::vector<Magick::Image> output;
 
     for (int i = 0; i < fps; i++) {
-        while (frac >= coalesced[index].animationDelay()) {
-            frac -= coalesced[index].animationDelay();
-            index = (index + 1) % coalesced.size();
+        if (total_delay == 0) {
+            // every frame has delay 0: the time-based walk below would never
+            // terminate, so just step one source frame per output frame
+            index = i % static_cast<int>(coalesced.size());
+        } else {
+            while (frac >= coalesced[index].animationDelay()) {
+                frac -= coalesced[index].animationDelay();
+                index = (index + 1) % coalesced.size();
+            }
         }
         Magick::Image im = coalesced[index];
         frac += delay;
@@ -530,7 +658,8 @@ Magick::Image kaleidoscopeSectorSymmetry(const Magick::Image &canvas,
     double a1 = sectorAngle;
 
     double step = 1.0; // 每 1 度采样
-    for (double a = a0; a <= a1; a += step) {
+    for (int k = 0; a0 + k * step <= a1; ++k) { // integer counter, same points
+        double a = a0 + k * step;
         double rad = a * M_PI / 180.0;
         poly.emplace_back(cx + r * cos(rad), cy + r * sin(rad));
     }

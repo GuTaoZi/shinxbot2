@@ -11,9 +11,17 @@ static std::mutex m;
 
 BarInfo::BarInfo(float pg, const std::string &dc)
     : progress(pg), desc(dc), f(nullptr), b(nullptr) {}
-void BarInfo::setProgress(float pg) { progress = pg; }
-void BarInfo::setDesc(const std::string &d) { this->desc = d; }
+// progressBar::desc() reads these from another thread under `m`.
+void BarInfo::setProgress(float pg) {
+    std::lock_guard<std::mutex> lock(m);
+    progress = pg;
+}
+void BarInfo::setDesc(const std::string &d) {
+    std::lock_guard<std::mutex> lock(m);
+    this->desc = d;
+}
 void BarInfo::setBar(float pg, const std::string &d) {
+    std::lock_guard<std::mutex> lock(m);
     progress = pg;
     this->desc = d;
 }

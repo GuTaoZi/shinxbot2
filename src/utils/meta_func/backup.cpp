@@ -72,19 +72,33 @@ bool archivist::make_archive(const fs::path &path) {
     if (archive == NULL) {
         set_global_log(LOG::ERROR, "backup zip create error");
         return false;
-    } else {
-        zip_set_default_password(archive, default_pwd.c_str());
+    }
+    zip_set_default_password(archive, default_pwd.c_str());
+    try {
         for (const auto &f : this->arc_list) {
-            for (const auto &[path, rele_path, passwd] : f.second) {
-                if (!this->archive_add_path(archive, path, passwd, rele_path)) {
-                    zip_close(archive);
+            for (const auto &[src_path, rele_path, passwd] : f.second) {
+                if (!this->archive_add_path(archive, src_path, passwd,
+                                            rele_path)) {
+                    // zip_close would write out the incomplete archive
+                    zip_discard(archive);
                     return false;
                 }
             }
         }
-        zip_close(archive);
-        return true;
+    } catch (const std::exception &e) { // fs::directory_iterator et al.
+        set_global_log(LOG::ERROR,
+                       std::string("backup: ") + e.what());
+        zip_discard(archive);
+        return false;
     }
+    // zip_close is where libzip actually writes the file (and can fail).
+    if (zip_close(archive) < 0) {
+        set_global_log(LOG::ERROR, std::string("backup zip write error: ") +
+                                       zip_strerror(archive));
+        zip_discard(archive);
+        return false;
+    }
+    return true;
 }
 
 void archivist::set_default_pwd(const std::string &pwd) {

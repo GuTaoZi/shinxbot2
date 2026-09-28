@@ -54,16 +54,21 @@ std::string message_to_string(const Json::Value &J, bool need_encode) {
         return need_encode ? cq_encode(J["data"]["text"].asString()) : J["data"]["text"].asString();
     } else {
         std::string ret = "[CQ:" + J["type"].asString();
-        for (auto u : J["data"].getMemberNames()) {
-            if (J["data"][u].isString()) {
-                ret += "," + u + "=" + cq_encode(J["data"][u].asString());
+        const Json::Value &data = J["data"];
+        for (const auto &u : data.getMemberNames()) {
+            const Json::Value &v = data[u];
+            ret += ',';
+            ret += u;
+            ret += '=';
+            if (v.isString()) {
+                ret += cq_encode(v.asString());
             } else {
                 Json::FastWriter writer;
                 writer.omitEndingLineFeed();
-                ret += "," + u + "=" + cq_encode(writer.write(J["data"][u]));
+                ret += cq_encode(writer.write(v));
             }
         }
-        ret += "]";
+        ret += ']';
         return ret;
     }
 }
