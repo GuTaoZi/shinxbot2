@@ -5,7 +5,7 @@ terminal using ANSI half-blocks, so it can be scanned directly from a shell.
 Pure stdlib (zlib only) — no Pillow/numpy needed. Handles PNG color type 0,
 bit depth 1, non-interlaced, with all five scanline filters.
 
-Usage: show-qr.py [path-to-qrcode.png]   (default: /opt/QQ/resources/app/app_launcher/napcat/cache/qrcode.png)
+Usage: show-qr.py [path-to-qrcode.png]   (default: $SHINX_QQ_DIR or /opt/QQ, + resources/app/app_launcher/napcat/cache/qrcode.png)
 """
 import os
 import struct
@@ -107,7 +107,7 @@ def render(path):
 
 
 if __name__ == "__main__":
-    p = sys.argv[1] if len(sys.argv) > 1 else os.path.expanduser("/opt/QQ/resources/app/app_launcher/napcat/cache/qrcode.png")
+    p = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.environ.get("SHINX_QQ_DIR", "/opt/QQ"), "resources/app/app_launcher/napcat/cache/qrcode.png")
     if not os.path.exists(p):
         sys.exit(f"QR file not found: {p}")
     try:

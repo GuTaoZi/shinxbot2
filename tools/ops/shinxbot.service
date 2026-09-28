@@ -17,7 +17,9 @@ Type=simple
 RemainAfterExit=yes
 KillMode=process
 WorkingDirectory=%h/shinxbot2
-ExecStart=%h/shinxbot2/tools/ops/shinx-ctl.sh boot
+# Via shinx-ha.sh: on the primary this takes the bot back from the backup host
+# (release peer + pull its state) before starting; see tools/ops/shinx-ha.sh.
+ExecStart=%h/shinxbot2/tools/ops/shinx-ha.sh boot
 ExecStop=%h/shinxbot2/tools/ops/shinx-ctl.sh stop
 
 [Install]

@@ -22,6 +22,8 @@
 #   backend-status                   NapCat backend session/process check
 #   backend-logs [N]                 Tail the NapCat tmux pane (default 40)
 #   backend-restart                  Restart NapCat (needed to refresh an expired QR)
+#   backend-stop                     Stop NapCat/QQ (frees the QQ login for the other host)
+#   active                           Exit 0 if this host holds the bot (bot or QQ running)
 #   boot                             Cold start: network -> NapCat -> wait for login -> bot
 #                                    (run at machine boot by tools/ops/shinxbot.service)
 #
@@ -35,13 +37,19 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# Host-local settings (never synced between hosts), e.g. SHINX_QQ_DIR for a
+# user-space QQ install. See tools/ops/host.env.example.
+HOST_ENV="${SHINX_HOST_ENV:-$HOME/.config/shinxbot/host.env}"
+# shellcheck disable=SC1090
+[ -f "$HOST_ENV" ] && . "$HOST_ENV"
 BOT_SESSION="bot"
-# Backend: NapCat.Shell hooked into LinuxQQ (/opt/QQ/resources/app/loadNapCat.js),
+# Backend: NapCat.Shell hooked into LinuxQQ ($QQ_DIR/resources/app/loadNapCat.js),
 # run headless under Xvfb. Bot account for quick-login comes from SHINX_BOT_QQ.
+QQ_DIR="${SHINX_QQ_DIR:-/opt/QQ}"
 BACKEND_SESSION="napcat"
-BACKEND_DIR="/opt/QQ/resources/app/app_launcher/napcat"
+BACKEND_DIR="$QQ_DIR/resources/app/app_launcher/napcat"
 BOT_QQ="${SHINX_BOT_QQ:-3664637421}"
-BACKEND_START="xvfb-run -a /opt/QQ/qq --no-sandbox -q $BOT_QQ"
+BACKEND_START="xvfb-run -a $QQ_DIR/qq --no-sandbox -q $BOT_QQ"
 BOT_BIN="./build/shinxbot"
 PORT_FILE="$ROOT/config/port.txt"
 QR_FILE="$BACKEND_DIR/cache/qrcode.png"
@@ -120,7 +128,10 @@ PY
 
 # --- process/session helpers ----------------------------------------------
 session_exists() { tmux has-session -t "$1" 2>/dev/null; }
-bot_pids()       { pgrep -f "$BOT_BIN" 2>/dev/null; }
+# Match the real processes only (exact comm name / binary at argv[0]); a bare
+# `pgrep -f "./build/shinxbot"` also matches any shell whose command line merely
+# mentions it (e.g. a monitoring ssh one-liner) and reports a phantom bot.
+bot_pids()       { pgrep -u "$(id -u)" -x shinxbot 2>/dev/null; }
 bot_running()    { [ -n "$(bot_pids)" ]; }
 
 # most-recent per-day log dir for the live bot qq (from the running API)
@@ -170,7 +181,7 @@ cmd_stop() {
     for _ in 1 2 3 4 5; do bot_running || break; sleep 1; done
     if bot_running; then
         warn "still up; sending SIGTERM to $(bot_pids | tr '\n' ' ')"
-        pkill -TERM -f "$BOT_BIN"; sleep 2
+        pkill -TERM -u "$(id -u)" -x shinxbot; sleep 2
     fi
     if bot_running; then bad "could not stop bot"; return 1; else ok "bot stopped"; fi
 }
@@ -209,7 +220,7 @@ cmd_backend_logs() { tmux capture-pane -pt "$BACKEND_SESSION" -S "-${1:-40}" 2>/
 
 cmd_backend_status() {
     echo -n "napcat session: "; session_exists "$BACKEND_SESSION" && echo "up" || { echo "MISSING"; return 1; }
-    pgrep -af "/opt/QQ/qq --no-sandbox" | sed 's/^/  /' || warn "no NapCat/QQ process found"
+    pgrep -u "$(id -u)" -af "$QQ_PAT" | sed 's/^/  /' || warn "no NapCat/QQ process found"
 }
 
 cmd_health() {
@@ -286,15 +297,33 @@ cmd_login() {
 }
 
 # Direct relaunch (no sudo): QQ with the NapCat hook, under Xvfb.
+QQ_PAT="^$QQ_DIR/qq( |\$)"
+qq_running() { pgrep -u "$(id -u)" -f "$QQ_PAT" >/dev/null; }
+kill_backend() {
+    tmux send-keys -t "$BACKEND_SESSION" C-c 2>/dev/null
+    for _ in $(seq 1 20); do qq_running || break; sleep 1; done
+    qq_running && { pkill -u "$(id -u)" -f "$QQ_PAT"; sleep 2; }
+    qq_running && { pkill -KILL -u "$(id -u)" -f "$QQ_PAT"; sleep 1; }
+    ! qq_running
+}
+cmd_backend_stop() {
+    if ! qq_running; then warn "backend not running"; return 0; fi
+    info "stopping backend (QQ/NapCat)"
+    if kill_backend; then ok "backend stopped"; else bad "could not stop QQ"; return 1; fi
+}
+# "Active" = this host holds (or is trying to hold) the bot's QQ login.
+cmd_active() {
+    if bot_running || qq_running; then echo "active"; return 0; fi
+    echo "standby"; return 1
+}
+
 cmd_backend_restart() {
     if ! session_exists "$BACKEND_SESSION"; then
         info "creating tmux session '$BACKEND_SESSION'"
         tmux new-session -d -s "$BACKEND_SESSION" -c "$BACKEND_DIR"
     else
         warn "restarting backend (this drops the current QQ connection; re-login needs a QR scan)"
-        tmux send-keys -t "$BACKEND_SESSION" C-c 2>/dev/null
-        for _ in $(seq 1 20); do pgrep -f "/opt/QQ/qq" >/dev/null || break; sleep 1; done
-        pgrep -f "/opt/QQ/qq" >/dev/null && { pkill -f "/opt/QQ/qq"; sleep 2; }
+        kill_backend
     fi
     tmux send-keys -t "$BACKEND_SESSION" "$BACKEND_START" C-m
     info "backend (re)start issued; a fresh QR appears in a few seconds — run '$0 login' to scan it"
@@ -308,7 +337,7 @@ cmd_backend_restart() {
 cmd_boot() {
     info "boot: waiting for network"
     for _ in $(seq 1 60); do getent hosts qq.com >/dev/null && break; sleep 2; done
-    if session_exists "$BACKEND_SESSION"; then info "boot: backend session already up"; else cmd_backend_restart; fi
+    if qq_running; then info "boot: backend already running"; else cmd_backend_restart; fi
     local qq="" i=0
     until qq="$(api_login_qq)"; [ -n "$qq" ]; do
         [ $((i % 12)) -eq 0 ] && warn "boot: backend not logged in yet — if it wants a QR, run '$0 login'"
@@ -352,6 +381,9 @@ case "$cmd" in
     backend-status) cmd_backend_status ;;
     backend-logs)   cmd_backend_logs "${1:-40}" ;;
     backend-restart) cmd_backend_restart ;;
+    backend-stop)   cmd_backend_stop ;;
+    active)         cmd_active ;;
+    _login_qq)      api_login_qq ;;   # internal, used by shinx-ha.sh
     boot)           cmd_boot ;;
     op)             if [ $# -gt 0 ]; then inject_cmd "$*"; else bad "usage: $0 op <command...>"; exit 1; fi ;;
     reload)         cmd_reload "${1:-all}" ;;
@@ -359,5 +391,5 @@ case "$cmd" in
     enable)         cmd_enable ;;
     disable)        cmd_disable ;;
     modules)        cmd_modules ;;
-    *) sed -n '2,32p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 1 ;;
+    *) sed -n '2,34p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

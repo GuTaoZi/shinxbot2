@@ -57,6 +57,39 @@ Prefer these verbs over ad-hoc tmux/ps commands:
 
 `build simple` skips rebuilding `libutils`; plain `build`/`main` builds everything.
 
+## Failover: yuki (primary) <-> Volcano (backup) — `tools/ops/shinx-ha.sh`
+
+Only ONE host may hold the bot's QQ login (a second Linux QQ login kicks the
+first), so this is active/standby. Host-local settings (never synced) live in
+`~/.config/shinxbot/host.env` — see `tools/ops/host.env.example`:
+
+| | yuki | Volcano |
+|---|---|---|
+| `SHINX_HA_ROLE` | `primary` | `backup` |
+| `SHINX_QQ_DIR` | `/opt/QQ` | `~/qqnt/opt/QQ` (user-space `dpkg -x` of QQ 3.2.33, no root) |
+| ssh alias of peer | `volcano` | `yuki` (38.42.217.82:729) |
+
+| Verb | Purpose |
+|------|---------|
+| `status` | Where the bot is: this host / peer = `online` (logged in) / `active` / `standby` / `unreachable` |
+| `takeover` | Move the bot HERE: release the peer, pull its `config/`+`resource/`, NapCat quick-login, start bot |
+| `release` | Stop bot + NapCat here (frees the QQ login) |
+| `sync` | Push state to the peer (refuses if the peer is also active = split brain) |
+| `code-push` | rsync source to the peer, rebuild framework + all plugins there, restart it if active |
+| `boot` | Machine boot (`shinxbot.service` on yuki): primary -> `takeover`; backup -> no-op |
+| `tick` | Cron, every minute on both hosts: active host pushes state every 5 min; backup takes over after 5 bad minutes; backup hands back once the primary is online again |
+| `pause` / `resume` | Stop / restart the automatic tick on this host (maintenance) |
+
+**State sync is OFF on both hosts** (`SHINX_HA_STATE_SYNC=0` in host.env): failover only, no
+periodic push and no state transfer on takeover — each host keeps its own `config/`+`resource/`
+(rua/bottle/poke daily state etc. diverge while the backup serves). `sync` still copies by hand.
+Transfers show an rsync progress line on a terminal (`SHINX_HA_PROGRESS=1` for logs).
+HA log: `~/.local/state/shinxbot/ha.log`. The China<->US link is slow; state syncs are
+incremental, but a first `code-push`/`sync` takes a few minutes.
+
+Each host needs ONE QR scan the first time it logs in; after that NapCat quick-login
+(`-q <qq>`) works across restarts and swaps.
+
 ## Backend login (QR) — the one manual step
 
 Backend login requires **scanning a QR with the target QQ's phone**; this cannot be
