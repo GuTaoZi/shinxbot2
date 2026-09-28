@@ -17,7 +17,9 @@
 #   takeover        Move the bot HERE: release peer, pull its state, start locally
 #   release         Stop bot + NapCat here (frees the QQ login)
 #   sync            Push state to the peer (only when active here and peer is not)
-#   code-push       Push source to the peer, rebuild there (restart if it's active)
+#   code-push       Peer pulls this host's pushed commits from GitHub, rebuilds
+#                   (restart if it's active); both repos must be committed+pushed
+#   code-push-rsync Old path: rsync the source tree over ssh, then rebuild
 #   boot            Machine-boot entry: primary -> takeover; backup -> nothing
 #   tick            Cron entry (every minute): periodic sync / watchdog / split-brain fix
 #   pause | resume  Disable / re-enable the automatic tick on this host
@@ -147,7 +149,69 @@ cmd_boot() {
     if [ "$ROLE" = primary ]; then BOOTING=1 cmd_takeover; else info "backup host: boot does nothing (watchdog decides)"; fi
 }
 
+# The yuki<->Volcano link is slow, so the default code-push has the peer pull
+# the exact commits from GitHub instead of receiving the tree over ssh. Both
+# repos here must be committed and pushed; the peer then moves to the same
+# SHAs (its local tracked edits are saved to ~/shinxbot2-local-*.patch first,
+# untracked config/resource/builds are left alone), updates submodules via
+# ssh (https to GitHub is unreliable from China), and rebuilds.
+repo_head() { # <dir> -> "<branch> <sha>", or fails if dirty / not pushed
+    local dir="$1" b sha up
+    b="$(git -C "$dir" symbolic-ref --short HEAD 2>/dev/null)" || { bad "$dir: detached HEAD"; return 1; }
+    sha="$(git -C "$dir" rev-parse HEAD)"
+    if [ -n "$(git -C "$dir" status --porcelain --untracked-files=no --ignore-submodules=dirty)" ]; then
+        bad "$dir has uncommitted tracked changes — commit + push first"; return 1
+    fi
+    up="$(git -C "$dir" rev-parse -q --verify "refs/remotes/origin/$b" 2>/dev/null)"
+    [ "$up" = "$sha" ] || { bad "$dir: $b is not pushed to origin ($sha vs ${up:-none})"; return 1; }
+    echo "$b $sha"
+}
+
+peer_build() {
+    ok "building on $PEER (framework + plugins)"
+    PEER_TIMEOUT=1800 peer "cd $PEER_ROOT && ./build.sh main >/tmp/shx-build.log 2>&1 && \
+        (cd plugins/functions && bash make_all.sh >/tmp/shx-plug-f.log 2>&1) && \
+        (cd plugins/events && bash make_all.sh >/tmp/shx-plug-e.log 2>&1) && \
+        ! grep -l 'error:' /tmp/shx-build.log /tmp/shx-plug-f.log /tmp/shx-plug-e.log" \
+        || { bad "build failed on $PEER — see /tmp/shx-build.log, /tmp/shx-plug-*.log there"; return 1; }
+    ok "build ok on $PEER"
+    if [ "$(peer_state)" != standby ]; then info "peer is active — restarting its bot"; peer "$PEER_ROOT/tools/ops/shinx-ctl.sh restart"; fi
+}
+
 cmd_code_push() {
+    local fw pl
+    fw="$(repo_head "$ROOT")" || return 1
+    pl="$(repo_head "$ROOT/plugins")" || return 1
+    info "peer pulls from GitHub: framework ${fw%% *}@${fw#* } plugins ${pl%% *}@${pl#* }"
+    # shellcheck disable=SC2086
+    PEER_TIMEOUT=900 peer bash -s -- "$PEER_ROOT" $fw $pl <<'EOF' || { bad "GitHub sync failed on $PEER (fallback: code-push-rsync)"; return 1; }
+set -euo pipefail
+root="$1"
+sync_repo() { # <dir> <branch> <sha>
+    cd "$1"
+    git fetch -q origin "$2"
+    got="$(git rev-parse FETCH_HEAD)"
+    [ "$got" = "$3" ] || { echo "origin/$2 is $got, expected $3" >&2; exit 2; }
+    if ! git diff --quiet HEAD --ignore-submodules=dirty; then
+        p="$HOME/shinxbot2-local-$(basename "$1")-$(date +%Y%m%d-%H%M%S).patch"
+        git diff HEAD --ignore-submodules=dirty > "$p"
+        echo "saved local tracked changes to $p"
+    fi
+    git checkout -q -f -B "$2" "$3"
+    git branch -q --set-upstream-to="origin/$2" 2>/dev/null || true
+    git -c url.git@github.com:.insteadOf=https://github.com/ submodule update -q --init --recursive
+    echo "$(basename "$1"): $(git log --oneline -1)"
+}
+sync_repo "$root" "$2" "$3"
+sync_repo "$root/plugins" "$4" "$5"
+EOF
+    peer_build || return 1
+    hlog "code-push (github) to $PEER ok: ${fw#* } / ${pl#* }"
+}
+
+# Old path: rsync the whole source tree over ssh (slow link; use when GitHub
+# is unreachable from the peer or for uncommitted experiments).
+cmd_code_push_rsync() {
     info "pushing source tree to $PEER:$PEER_ROOT"
     "${RSYNC[@]}" --delete \
         --exclude='/config/' --exclude='/resource/' --exclude='/log/' --exclude='/backup/' \
@@ -156,15 +220,9 @@ cmd_code_push() {
         --exclude='/plugins/lib/functions/.hot/' --exclude='/.claude/' --exclude='__pycache__/' \
         --exclude='*.jpeg' --exclude='*.tmp' --exclude='/qq.location' \
         "$ROOT/" "$PEER:$PEER_ROOT/" || { bad "rsync failed"; return 1; }
-    ok "source pushed; building on $PEER (framework + plugins)"
-    PEER_TIMEOUT=1800 peer "cd $PEER_ROOT && ./build.sh main >/tmp/shx-build.log 2>&1 && \
-        (cd plugins/functions && bash make_all.sh >/tmp/shx-plug-f.log 2>&1) && \
-        (cd plugins/events && bash make_all.sh >/tmp/shx-plug-e.log 2>&1) && \
-        ! grep -l 'error:' /tmp/shx-build.log /tmp/shx-plug-f.log /tmp/shx-plug-e.log" \
-        || { bad "build failed on $PEER — see /tmp/shx-build.log, /tmp/shx-plug-*.log there"; return 1; }
-    ok "build ok on $PEER"
-    if [ "$(peer_state)" != standby ]; then info "peer is active — restarting its bot"; peer "$PEER_ROOT/tools/ops/shinx-ctl.sh restart"; fi
-    hlog "code-push to $PEER ok"
+    ok "source pushed"
+    peer_build || return 1
+    hlog "code-push (rsync) to $PEER ok"
 }
 
 # Cron entry. Rules (this host's point of view):
@@ -215,11 +273,12 @@ case "$cmd" in
     release)   with_lock; cmd_release ;;
     sync)      with_lock; cmd_sync ;;
     code-push) with_lock; cmd_code_push ;;
+    code-push-rsync) with_lock; cmd_code_push_rsync ;;
     boot)      with_lock; cmd_boot ;;
     tick)      with_lock; cmd_tick ;;
     pause)     touch "$STATE_DIR/paused"; ok "automatic tick paused on this host" ;;
     resume)    rm -f "$STATE_DIR/paused"; ok "automatic tick resumed" ;;
     log)       tail -n "${1:-40}" "$LOG" ;;
     _state)    local_state ;;
-    *) sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 1 ;;
+    *) sed -n '2,29p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

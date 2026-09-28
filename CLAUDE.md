@@ -75,7 +75,8 @@ first), so this is active/standby. Host-local settings (never synced) live in
 | `takeover` | Move the bot HERE: release the peer, pull its `config/`+`resource/`, NapCat quick-login, start bot |
 | `release` | Stop bot + NapCat here (frees the QQ login) |
 | `sync` | Push state to the peer (refuses if the peer is also active = split brain) |
-| `code-push` | rsync source to the peer, rebuild framework + all plugins there, restart it if active |
+| `code-push` | Peer pulls this host's pushed commits (framework + plugins) from GitHub, rebuilds everything there, restarts it if active. Both repos must be committed and pushed. |
+| `code-push-rsync` | Old path: rsync the source tree over ssh (slow link), then rebuild — for when GitHub is unreachable from the peer |
 | `boot` | Machine boot (`shinxbot.service` on yuki): primary -> `takeover`; backup -> no-op |
 | `tick` | Cron, every minute on both hosts: active host pushes state every 5 min; backup takes over after 5 bad minutes; backup hands back once the primary is online again |
 | `pause` / `resume` | Stop / restart the automatic tick on this host (maintenance) |
@@ -85,7 +86,7 @@ periodic push and no state transfer on takeover — each host keeps its own `con
 (rua/bottle/poke daily state etc. diverge while the backup serves). `sync` still copies by hand.
 Transfers show an rsync progress line on a terminal (`SHINX_HA_PROGRESS=1` for logs).
 HA log: `~/.local/state/shinxbot/ha.log`. The China<->US link is slow; state syncs are
-incremental, but a first `code-push`/`sync` takes a few minutes.
+incremental, but a first `sync` takes a few minutes — which is why `code-push` goes through GitHub.
 
 Each host needs ONE QR scan the first time it logs in; after that NapCat quick-login
 (`-q <qq>`) works across restarts and swaps.
