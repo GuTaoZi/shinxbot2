@@ -5,8 +5,9 @@
 # kicks the first), so this is active/standby, not active/active:
 #   * the ACTIVE host runs NapCat + bot and pushes bot state (config/, resource/)
 #     to the standby every few minutes;
-#   * the BACKUP host's watchdog takes over if the primary stays unreachable /
-#     logged out for SHINX_HA_THRESHOLD consecutive minutes;
+#   * the BACKUP host's watchdog takes over if the primary stays unreachable or
+#     idle for SHINX_HA_THRESHOLD consecutive minutes — tentatively: it never
+#     stops a primary that is up, and gives up if it can't log in unattended;
 #   * the PRIMARY host takes the bot back at boot (tools/ops/shinxbot.service).
 #
 # Host-local settings live in ~/.config/shinxbot/host.env (see host.env.example):
@@ -37,7 +38,9 @@ HOST_ENV="${SHINX_HOST_ENV:-$HOME/.config/shinxbot/host.env}"
 ROLE="${SHINX_HA_ROLE:-primary}"
 PEER="${SHINX_HA_PEER:-}"
 PEER_ROOT="${SHINX_HA_PEER_ROOT:-}"
-THRESHOLD="${SHINX_HA_THRESHOLD:-5}"          # consecutive bad minutes before backup takes over
+THRESHOLD="${SHINX_HA_THRESHOLD:-10}"         # consecutive bad minutes before backup takes over
+LOGIN_WAIT="${SHINX_HA_LOGIN_WAIT:-600}"      # watchdog takeover: seconds to wait for a login
+RETRY_AFTER="${SHINX_HA_RETRY_AFTER:-3600}"   # after a failed watchdog takeover, wait this long
 SYNC_EVERY="${SHINX_HA_SYNC_EVERY:-300}"      # seconds between state pushes
 # 0 = failover only: no periodic push, no state transfer on takeover/hand-back
 # (each host keeps its own config/+resource/; `sync` still works by hand).
@@ -117,9 +120,19 @@ cmd_sync() {
     if push_state; then date +%s > "$STATE_DIR/last_sync"; ok "state pushed to $PEER"; else bad "state push failed"; hlog "sync failed"; return 1; fi
 }
 
-# takeover [--no-wait]: --no-wait starts NapCat+bot in the background (watchdog use).
+# takeover [--no-wait|--watchdog]: --no-wait starts NapCat+bot in the background.
+# --watchdog (cron) is the tentative form: re-probe the peer and back off if it is
+# up at all — a peer merely "active" may be mid-login, and stopping a live peer
+# because the link flapped is what took the bot down on 2026-10-13 — then start
+# in the background with a login deadline, so a host that would need a QR scan
+# stops its QQ again instead of waiting on it for good.
 cmd_takeover() {
-    local ps; ps="$(peer_state)"
+    local mode="${1:-}" ps; ps="$(peer_state)"
+    if [ "$mode" = "--watchdog" ]; then
+        case "$ps" in
+            online|active) hlog "watchdog: peer is $ps again — not taking over"; return 0 ;;
+        esac
+    fi
     # At boot the network may lag: don't mistake "no route yet" for "peer dead".
     if [ "$ps" = unreachable ] && [ "${BOOTING:-0}" = 1 ]; then
         for _ in $(seq 1 8); do sleep 15; ps="$(peer_state)"; [ "$ps" != unreachable ] && break; done
@@ -137,7 +150,12 @@ cmd_takeover() {
         unreachable) warn "peer unreachable — using local state (as of last sync)" ;;
     esac
     hlog "takeover (peer was $ps)"
-    if [ "${1:-}" = "--no-wait" ]; then
+    if [ "$mode" = "--watchdog" ]; then
+        # 9>&- as below. A failed login leaves a timestamp the watchdog backs off on.
+        setsid nohup bash -c '"$1" boot --login-wait "$2" || date +%s > "$3"' _ \
+            "$CTL" "$LOGIN_WAIT" "$STATE_DIR/takeover_failed" >> "$LOG" 2>&1 < /dev/null 9>&- &
+        info "tentative boot launched in background (login wait ${LOGIN_WAIT}s, log: $LOG)"
+    elif [ "$mode" = "--no-wait" ]; then
         # 9>&- : don't hand the HA lock to the background boot (and the QQ it
         # starts). Otherwise, while it waits for a login that never comes,
         # every later tick finds the lock taken and exits — including the one
@@ -237,8 +255,9 @@ cmd_code_push_rsync() {
 #      - backup AND peer online  -> primary is back: push newer state, release here
 #      - primary, logged out, peer online for a while -> we got kicked: release here
 #      - otherwise push state every SYNC_EVERY seconds
-#  * standby here AND backup: watchdog — peer unreachable or not online for
-#    THRESHOLD consecutive ticks -> take over.
+#  * standby here AND backup: watchdog — peer unreachable or standby for
+#    THRESHOLD consecutive ticks -> tentative takeover (see cmd_takeover), at
+#    most once per RETRY_AFTER seconds after one that couldn't log in.
 cmd_tick() {
     [ -f "$STATE_DIR/paused" ] && exit 0
     local ls ps fails; ls="$(local_state)"; ps="$(peer_state)"
@@ -263,13 +282,18 @@ cmd_tick() {
         return
     fi
     [ "$ROLE" = backup ] || return 0
-    if [ "$ps" = online ]; then echo 0 > "$STATE_DIR/fails"; return; fi
+    case "$ps" in online|active) echo 0 > "$STATE_DIR/fails"; return ;; esac
     fails=$(( $(cat "$STATE_DIR/fails" 2>/dev/null || echo 0) + 1 )); echo "$fails" > "$STATE_DIR/fails"
     hlog "watchdog: peer $ps ($fails/$THRESHOLD)"
     if [ "$fails" -ge "$THRESHOLD" ]; then
         echo 0 > "$STATE_DIR/fails"
-        hlog "watchdog: taking over"
-        cmd_takeover --no-wait >> "$LOG" 2>&1
+        local failed; failed="$(cat "$STATE_DIR/takeover_failed" 2>/dev/null || echo 0)"
+        if [ $(( $(date +%s) - failed )) -lt "$RETRY_AFTER" ]; then
+            hlog "watchdog: last takeover couldn't log in (needs a QR?) — next try after $(date -d "@$((failed + RETRY_AFTER))" '+%F %T')"
+            return
+        fi
+        hlog "watchdog: taking over (tentative)"
+        cmd_takeover --watchdog >> "$LOG" 2>&1
     fi
 }
 
@@ -287,5 +311,5 @@ case "$cmd" in
     resume)    rm -f "$STATE_DIR/paused"; ok "automatic tick resumed" ;;
     log)       tail -n "${1:-40}" "$LOG" ;;
     _state)    local_state ;;
-    *) sed -n '2,29p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 1 ;;
+    *) sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

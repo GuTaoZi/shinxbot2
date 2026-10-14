@@ -24,8 +24,9 @@
 #   backend-restart                  Restart NapCat (needed to refresh an expired QR)
 #   backend-stop                     Stop NapCat/QQ (frees the QQ login for the other host)
 #   active                           Exit 0 if this host holds the bot (bot or QQ running)
-#   boot                             Cold start: network -> NapCat -> wait for login -> bot
-#                                    (run at machine boot by tools/ops/shinxbot.service)
+#   boot [--login-wait SECS]         Cold start: network -> NapCat -> wait for login -> bot
+#                                    (run at machine boot by tools/ops/shinxbot.service);
+#                                    with --login-wait, give up + stop NapCat after SECS
 #
 # Operator commands (injected as an op, no QQ needed; SHINX_OP_SILENT=1 = no reply):
 #   op <words...>                    Inject an arbitrary operator command
@@ -54,6 +55,8 @@ BOT_BIN="./build/shinxbot"
 PORT_FILE="$ROOT/config/port.txt"
 QR_FILE="$BACKEND_DIR/cache/qrcode.png"
 QR_RENDER="$ROOT/tools/ops/show-qr.py"
+# Pid of a `boot` still waiting for the login (shared with shinx-ha.sh's state dir).
+BOOT_PIDFILE="$HOME/.local/state/shinxbot/boot.pid"
 
 C_R='\033[0;31m'; C_G='\033[0;32m'; C_Y='\033[1;33m'; C_B='\033[0;36m'; C_N='\033[0m'
 ok()   { echo -e "${C_G}[ ok ]${C_N} $*"; }
@@ -306,7 +309,17 @@ kill_backend() {
     qq_running && { pkill -KILL -u "$(id -u)" -f "$QQ_PAT"; sleep 1; }
     ! qq_running
 }
+# A boot waiting on a login must not outlive the backend it waits for: it
+# would sit there forever, or start the bot behind a later, unrelated login.
+boot_pid() { local p; p="$(cat "$BOOT_PIDFILE" 2>/dev/null)" && kill -0 "$p" 2>/dev/null && echo "$p"; }
+cancel_boot() {
+    local p; p="$(boot_pid)" || return 0
+    [ "$p" = "$$" ] && return 0
+    info "cancelling pending boot (pid $p)"
+    kill "$p" 2>/dev/null; rm -f "$BOOT_PIDFILE"
+}
 cmd_backend_stop() {
+    cancel_boot
     if ! qq_running; then warn "backend not running"; return 0; fi
     info "stopping backend (QQ/NapCat)"
     if kill_backend; then ok "backend stopped"; else bad "could not stop QQ"; return 1; fi
@@ -333,14 +346,25 @@ cmd_backend_restart() {
 # must not start before the backend is logged in: shinxbot::init() takes botqq
 # from get_login_info (-> 0 while logged out, and logs land in log/0/). So this
 # waits on the login indefinitely — if NapCat falls back to a QR, the bot comes
-# up by itself as soon as someone scans it (`login`).
+# up by itself as soon as someone scans it (`login`). With --login-wait SECS
+# (the HA watchdog's tentative takeover) it instead gives up after SECS, stops
+# the backend and exits 1, so an unattended host doesn't hold QQ hostage.
 cmd_boot() {
+    local wait=0
+    [ "${1:-}" = "--login-wait" ] && wait="${2:-600}"
+    local other; other="$(boot_pid)" && { warn "boot: another boot (pid $other) is already waiting — not starting a second"; return 1; }
+    mkdir -p "$(dirname "$BOOT_PIDFILE")"; echo "$$" > "$BOOT_PIDFILE"
+    trap '[ "$(cat "$BOOT_PIDFILE" 2>/dev/null)" = "$$" ] && rm -f "$BOOT_PIDFILE"' EXIT
     info "boot: waiting for network"
     for _ in $(seq 1 60); do getent hosts qq.com >/dev/null && break; sleep 2; done
     if qq_running; then info "boot: backend already running"; else cmd_backend_restart; fi
     local qq="" i=0
     until qq="$(api_login_qq)"; [ -n "$qq" ]; do
         [ $((i % 12)) -eq 0 ] && warn "boot: backend not logged in yet — if it wants a QR, run '$0 login'"
+        if [ "$wait" -gt 0 ] && [ $((i * 5)) -ge "$wait" ]; then
+            bad "$(date '+%F %T') boot: no login after ${wait}s — giving up, stopping backend"
+            kill_backend; return 1
+        fi
         i=$((i + 1)); sleep 5
     done
     ok "boot: backend logged in (qq=$qq)"
@@ -384,12 +408,12 @@ case "$cmd" in
     backend-stop)   cmd_backend_stop ;;
     active)         cmd_active ;;
     _login_qq)      api_login_qq ;;   # internal, used by shinx-ha.sh
-    boot)           cmd_boot ;;
+    boot)           cmd_boot "$@" ;;
     op)             if [ $# -gt 0 ]; then inject_cmd "$*"; else bad "usage: $0 op <command...>"; exit 1; fi ;;
     reload)         cmd_reload "${1:-all}" ;;
     swap)           cmd_swap "${1:-}" "${2:-function}" ;;
     enable)         cmd_enable ;;
     disable)        cmd_disable ;;
     modules)        cmd_modules ;;
-    *) sed -n '2,34p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 1 ;;
+    *) sed -n '2,36p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac
